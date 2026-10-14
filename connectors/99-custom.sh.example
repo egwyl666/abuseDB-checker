@@ -1,0 +1,55 @@
+# shellcheck shell=bash
+# abuse-checker connector template
+# =================================
+# Copy this file to /usr/local/lib/abuse-checker/connectors.d/ with a .sh
+# extension to activate it, e.g.:
+#
+#   sudo install -m 0644 99-custom.sh.example \
+#       /usr/local/lib/abuse-checker/connectors.d/40-webhook.sh
+#
+# Files run in numeric order (10-, 20-, ...). Each file is loaded in its own
+# subshell, so a failing connector never affects the others. abuse-checker
+# skips (with a warning) any file that is empty, contains only comments,
+# fails `bash -n`, or does not define BOTH functions below.
+#
+# Settings: add your variables to the encrypted store with
+#   sudo abuse-checker --edit-secrets
+# Values are exported into the environment and scrubbed from logs only if
+# they are among the known secrets; never print them yourself.
+#
+# Helpers you can use (provided by abuse-checker):
+#   secure_curl "<config>" [args]  curl with URL/headers passed via stdin config
+#   cfg_line <option> <value>      one safely quoted curl config line
+#   split_csv "<a,b,c>"            one trimmed item per line
+#   plain_summary <data> <title>   plain-text summary of the run
+#   info / warn "<message>"        log to journald
+#   $TMPD                          private temp dir, removed on exit
+#   $FORCE_FULL, $HOST_LABEL       run flags / host name
+#
+# The <data> file is a JSON array of objects:
+#   {target, status: NEW|ESCALATED|UNCHANGED|CLEAN|ERROR, score, total,
+#    delta, last, isp, domain, country}
+
+# Shown in logs.
+# shellcheck disable=SC2034
+CONNECTOR_NAME="Custom webhook"
+
+# Return 0 when this connector is configured, non-zero to skip it silently.
+connector_enabled() {
+    [[ -n "${CUSTOM_WEBHOOK_URL:-}" ]]
+}
+
+# connector_send <classified.json> <report.html> <title>
+# Return non-zero on failure; abuse-checker logs it and continues.
+connector_send() {
+    local data="$1" report="$2" title="$3" payload="$TMPD/custom.json"
+    jq --arg title "$title" --arg report "$(basename "$report")" \
+        '{title:$title, report:$report,
+          alerts:[.[] | select(.status=="NEW" or .status=="ESCALATED")
+                  | {ip:.target, status, score, reports:.total, delta}]}' \
+        "$data" > "$payload"
+    # The URL goes through stdin, never argv.
+    secure_curl "$(cfg_line url "$CUSTOM_WEBHOOK_URL")
+$(cfg_line header "Content-Type: application/json")" \
+        --max-time 30 --fail -o /dev/null --data-binary "@$payload"
+}

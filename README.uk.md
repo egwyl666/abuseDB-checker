@@ -21,6 +21,8 @@
 - [Розташування файлів (FHS)](#розташування-файлів-fhs)
 - [Встановлення](#встановлення)
 - [Налаштування](#налаштування)
+- [Зашифровані секрети](#зашифровані-секрети)
+- [Конектори](#конектори)
 - [Керування IP-адресами та отримувачами](#керування-ip-адресами-та-отримувачами)
 - [Довідка CLI](#довідка-cli)
 - [Щоденне обслуговування](#щоденне-обслуговування)
@@ -90,24 +92,33 @@
 
 ## Розташування файлів (FHS)
 
-| Шлях                                         | Права  | Власник                     | Призначення                                    |
-|----------------------------------------------|--------|-----------------------------|------------------------------------------------|
-| `/usr/local/bin/abuse-checker`               | `0755` | `root:root`                 | Основний виконуваний файл (у `$PATH`)          |
-| `/etc/abuse-checker/secrets.conf`            | `0600` | `root:root`                 | API-ключі, токени, вебхуки, SMTP, налаштування |
-| `/etc/abuse-checker/secrets.conf.example`    | `0644` | `root:root`                 | Довідкова копія всіх налаштувань               |
-| `/etc/abuse-checker/ips.txt`                 | `0644` | `root:abusechecker`         | IP-адреси та CIDR для моніторингу              |
-| `/var/lib/abuse-checker/state.json`          | `0640` | `abusechecker:abusechecker` | База даних стану для порівняння                |
-| `/var/lib/abuse-checker/state.dryrun.json`   | `0640` | `abusechecker:abusechecker` | Окремий стан для `--dry-run`                   |
-| `/var/lib/abuse-checker/reports/`            | `0750` | `abusechecker:abusechecker` | Згенеровані `.html`-звіти                      |
-| `/etc/systemd/system/abuse-checker.service`  | `0644` | `root:root`                 | Ізольований oneshot-сервіс                     |
-| `/etc/systemd/system/abuse-checker.timer`    | `0644` | `root:root`                 | Щоденний запуск (06:00 + до 15 хв випадково)   |
-| `/usr/local/share/doc/abuse-checker/`        | `0755` | `root:root`                 | Цей README                                     |
+| Шлях                                                   | Права  | Власник                     | Призначення                                        |
+|--------------------------------------------------------|--------|-----------------------------|----------------------------------------------------|
+| `/usr/local/bin/abuse-checker`                         | `0755` | `root:root`                 | Основний виконуваний файл (у `$PATH`)              |
+| `/usr/local/lib/abuse-checker/connectors.d/`           | `0755` | `root:root`                 | Конектори сповіщень (`*.sh`, виконуються по черзі) |
+| `/etc/abuse-checker/secrets.conf.enc`                  | `0640` | `root:abusechecker`         | Секрети, зашифровані AES-256 (рівень OpenSSL)      |
+| `/etc/abuse-checker/.master.key`                       | `0400` | `root:root`                 | Випадковий 256-бітний ключ для рівня OpenSSL       |
+| `/etc/abuse-checker/secrets.cred`                      | `0600` | `root:root`                 | Секрети, зашифровані `systemd-creds` (рівень 1)    |
+| `/etc/abuse-checker/secrets.conf`                      | `0600` | `root:root`                 | *Застарілий* відкритий текст; перенесіть через `--encrypt-secrets` |
+| `/etc/abuse-checker/secrets.conf.example`              | `0644` | `root:root`                 | Довідкова копія всіх налаштувань                   |
+| `/etc/abuse-checker/ips.txt`                           | `0644` | `root:abusechecker`         | IP-адреси та CIDR для моніторингу                  |
+| `/var/lib/abuse-checker/state.json`                    | `0640` | `abusechecker:abusechecker` | База даних стану для порівняння                    |
+| `/var/lib/abuse-checker/state.dryrun.json`             | `0640` | `abusechecker:abusechecker` | Окремий стан для `--dry-run`                       |
+| `/var/lib/abuse-checker/reports/`                      | `0750` | `abusechecker:abusechecker` | Згенеровані `.html`-звіти                          |
+| `/etc/systemd/system/abuse-checker.service`            | `0644` | `root:root`                 | Ізольований oneshot-сервіс                         |
+| `/etc/systemd/system/abuse-checker.service.d/10-secrets.conf` | `0644` | `root:root`          | Генерується: як systemd передає секрети сервісу    |
+| `/etc/systemd/system/abuse-checker.timer`              | `0644` | `root:root`                 | Щоденний запуск (06:00 + до 15 хв випадково)       |
+| `/usr/local/share/doc/abuse-checker/`                  | `0755` | `root:root`                 | Файли README                                       |
+
+Одночасно існує лише один із файлів `secrets.cred`, `secrets.conf.enc` або
+`secrets.conf`.
 
 Структура репозиторію:
 
 ```
 abuse-checker.sh            основний скрипт (встановлюється як /usr/local/bin/abuse-checker)
-install.sh / uninstall.sh   встановлення та видалення
+connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 99-custom.sh.example
+install.sh / uninstall.sh   встановлення (з майстром налаштування) та видалення
 systemd/                    юніти сервісу й таймера
 config/                     secrets.conf.example, ips.txt.example
 tests/run_tests.sh          офлайн-набір тестів (використовує tests/mock_curl.sh)
@@ -117,31 +128,59 @@ tests/run_tests.sh          офлайн-набір тестів (викорис
 
 ## Встановлення
 
-Вимоги: Linux із systemd, Bash 4.4+, `curl` 7.55+ та `jq` 1.6+.
+Вимоги: Linux із systemd, Bash 4.4+, `curl` 7.55+, `jq` 1.6+ та `openssl`
+(systemd 250+ використовується автоматично, якщо доступний).
 
 ```bash
 # Debian/Ubuntu
-sudo apt install -y curl jq
+sudo apt install -y curl jq openssl
 # RHEL/Alma/Rocky/Fedora
-sudo dnf install -y curl jq
+sudo dnf install -y curl jq openssl
 
 git clone <цей репозиторій> abuse-checker && cd abuse-checker
 bash tests/run_tests.sh          # необов'язково: спочатку запустити офлайн-тести
-sudo ./install.sh                # створює користувача, каталоги, юніти; вмикає таймер
+sudo ./install.sh                # створює користувача, каталоги, юніти, зашифроване сховище; вмикає таймер
 ```
 
-`install.sh` ідемпотентний. Він **ніколи не перезаписує** наявні
-`secrets.conf`, `ips.txt` чи `state.json`, лише виправляє їхніх власників і
-права доступу. Використовуйте `--no-enable`, щоб встановити без запуску
-таймера.
+`install.sh` ідемпотентний. Він **ніколи не перезаписує** наявні секрети,
+`ips.txt` чи `state.json`, лише виправляє їхніх власників і права доступу.
+Параметри:
+
+- `--no-enable`: встановити без запуску таймера;
+- `--non-interactive` (`-n`): ніколи не показувати майстер налаштування
+  (він також автоматично пропускається без TTY, наприклад в Ansible чи
+  cloud-init).
+
+### Майстер налаштування
+
+Наприкінці інтерактивного встановлення з'являється запитання:
+
+```
+Would you like to configure API keys and notification connectors now? [y/N]
+(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets')
+```
+
+Натисніть Enter, щоб пропустити його. Якщо відповісти `y`, майстер проведе
+через чотири необов'язкові кроки. Натисніть Enter на будь-якому запитанні,
+щоб пропустити цей крок:
+
+1. API-ключ(і) AbuseIPDB
+2. Конектор Telegram (токен бота + ідентифікатори чатів)
+3. Конектор Slack (URL вебхуків)
+4. Конектор Email (отримувачі + URL/користувач/пароль SMTP)
+
+Токени й паролі вводяться без відображення. Кожне значення одразу потрапляє в
+зашифроване сховище через `abuse-checker --set-secret` (через stdin), тож
+жоден файл із відкритим текстом не створюється. Наприкінці майстер пропонує
+запустити `--test-notify`.
 
 Далі:
 
 ```bash
-sudo editor /etc/abuse-checker/secrets.conf   # щонайменше ABUSEIPDB_API_KEYS
+sudo abuse-checker --edit-secrets              # якщо ви пропустили майстер
 sudo editor /etc/abuse-checker/ips.txt
 sudo abuse-checker --dry-run                   # тестові дані, перевірка всього ланцюжка
-sudo abuse-checker --test-notify               # тестове сповіщення в усі канали
+sudo abuse-checker --test-notify               # тестове сповіщення в усі конектори
 sudo systemctl start abuse-checker.service     # перший реальний запуск
 journalctl -u abuse-checker -n 50 --no-pager
 ```
@@ -154,10 +193,11 @@ journalctl -u abuse-checker -n 50 --no-pager
 
 ## Налаштування
 
-Усе зберігається в `/etc/abuse-checker/secrets.conf`. systemd читає його
-через `EnvironmentFile=`, а скрипт підключає його, коли запущений від root.
-Пишіть лише прості рядки `KEY="value"`: без `$змінних` і без підстановки
-команд, бо systemd їх не розгортає.
+Усі налаштування зберігаються в зашифрованому сховищі секретів (див.
+[Зашифровані секрети](#зашифровані-секрети)). Змінюйте їх командою
+`sudo abuse-checker --edit-secrets`. Пишіть лише прості рядки `KEY="value"`
+або `KEY='value'`: без `$змінних` і без підстановки команд. Інше редактор не
+прийме.
 
 | Змінна                | Типово          | Опис                                                                |
 |-----------------------|-----------------|---------------------------------------------------------------------|
@@ -206,13 +246,17 @@ sudo editor /etc/abuse-checker/ips.txt
 
 ### Отримувачі
 
-Усі ці налаштування приймають списки через кому. Відредагуйте
-`secrets.conf`, а потім перевірте доставку:
+Усі ці налаштування приймають списки через кому. Відредагуйте зашифроване
+сховище, а потім перевірте доставку:
 
 ```bash
-sudo editor /etc/abuse-checker/secrets.conf
+sudo abuse-checker --edit-secrets
 sudo abuse-checker --test-notify
 ```
+
+Порожнє налаштування просто вимикає відповідний конектор. Щоб прибрати
+команду, видаліть її зі списку. Щоб додати новий тип каналу, див.
+[Конектори](#конектори).
 
 - **Telegram:** створіть бота через @BotFather і додайте його в кожну групу.
   Щоб дізнатися ідентифікатори чатів, напишіть боту повідомлення і відкрийте
@@ -227,10 +271,95 @@ sudo abuse-checker --test-notify
 
 ---
 
+## Зашифровані секрети
+
+Секрети зберігаються в зашифрованому вигляді. Рівень визначається
+автоматично під час першого збереження секретів:
+
+| Рівень | Коли | Файли | Як їх отримує сервіс |
+|--------|------|-------|----------------------|
+| 1. `systemd-creds` | працює systemd ≥ 250 і `systemd-creds encrypt` спрацьовує (TPM2 та/або ключ хоста) | `secrets.cred` | `LoadCredentialEncrypted=secrets:...`. systemd розшифровує у приватний каталог облікових даних сервісу, який не потрапляє у swap. |
+| 2. OpenSSL | у всіх інших випадках | `secrets.conf.enc` + `.master.key` | `LoadCredential=master.key:...`. Сервіс розшифровує через `openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000` у пам'ять (канал) і підключає результат. |
+| Застарілий | звичайний `secrets.conf`, який ви створили самі | `secrets.conf` | `EnvironmentFile=`. Досі працює, але під час кожного запуску пише попередження. |
+
+Відповідний drop-in systemd, `abuse-checker.service.d/10-secrets.conf`,
+перезаписується автоматично щоразу, коли змінюється сховище. Рівень можна
+задати примусово через `ABUSE_CHECKER_CRYPTO=openssl|systemd`.
+
+```bash
+sudo abuse-checker --edit-secrets      # розшифрувати -> /dev/shm (0600) -> $EDITOR -> перевірити -> зашифрувати -> знищити
+sudo abuse-checker --encrypt-secrets   # перенести звичайний secrets.conf і знищити його
+printf '%s\n' "$VALUE" | sudo abuse-checker --set-secret SLACK_WEBHOOK_URLS   # для скриптів, значення через stdin
+```
+
+Як працює `--edit-secrets`:
+
+- Розшифрована копія існує лише як файл із правами `0600` у `/dev/shm`, тобто
+  в оперативній пам'яті. Якщо `/dev/shm` недоступний, команда відмовляється
+  працювати, а не записує файл на диск.
+- Редактор вибирається в такому порядку: `$VISUAL`, `$EDITOR`, `nano`, `vi`.
+- Після виходу з редактора файл перевіряється: дозволені лише коментарі та
+  рядки `KEY="value"`, і `bash -n` має пройти успішно. Якщо перевірка не
+  пройшла, редактор можна відкрити знову. Якщо ви відмовитеся, нічого не
+  зміниться.
+- Новий шифротекст перевіряється повторним розшифруванням, перш ніж він
+  замінить старий файл. Після цього копія в RAM знищується, зокрема при
+  помилках і Ctrl-C.
+- Якщо ви зберегли файл без змін, повторне шифрування не виконується.
+
+Зберігайте резервну копію `.master.key` (або ключа облікових даних systemd на
+хості) разом із `secrets.conf.enc`. Без ключа секрети відновити неможливо, і
+запуск переривається з помилкою `cannot decrypt`, а не працює з порожньою
+конфігурацією.
+
+---
+
+## Конектори
+
+Сповіщення надсилають модулі з `/usr/local/lib/abuse-checker/connectors.d/`
+(або з `connectors/` під час запуску з робочої копії репозиторію). Кожен файл
+`*.sh` виконується в порядку імен, кожен **у власній підоболонці**, тож збій
+одного конектора не зупиняє інші та сам запуск.
+
+| Файл | Налаштування |
+|------|--------------|
+| `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
+| `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
+| `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
+| `99-custom.sh.example` | Задокументований шаблон. Не завантажується, бо не закінчується на `.sh`. |
+
+Конектор визначає дві функції:
+
+```bash
+connector_enabled   # повертає 0, коли налаштування задані; інакше конектор мовчки пропускається
+connector_send      # $1 = класифікований JSON, $2 = report.html, $3 = заголовок; ненульовий код = збій (пишеться в лог)
+```
+
+Файли, які могли б зламати запуск, пропускаються з попередженням, а решта
+конекторів усе одно виконується. Файл пропускається, якщо він:
+
+1. порожній (0 байтів) або містить лише пробіли й коментарі;
+2. не проходить `bash -n`;
+3. не визначає обидві функції `connector_enabled` і `connector_send` після
+   підключення в тестовій підоболонці.
+
+Щоб додати конектор, виконайте
+`sudo install -m 0644 99-custom.sh.example /usr/local/lib/abuse-checker/connectors.d/40-mywebhook.sh`.
+Відредагуйте його, додайте його налаштування через `--edit-secrets` і
+перевірте через `abuse-checker --status` (рядок `Connectors`) та
+`--test-notify`. Конектори можуть використовувати вбудовані допоміжні функції
+`secure_curl`, `cfg_line`, `split_csv`, `plain_summary`, `info` і `warn`.
+Будь-яке налаштування, назва якого містить `TOKEN`, `_KEY`, `PASS`, `SECRET`
+чи `WEBHOOK`, автоматично маскується в логах. Інсталятор оновлює вбудовані
+конектори і не чіпає ваші власні.
+
+---
+
 ## Довідка CLI
 
 ```
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
+abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
 ```
 
 | Прапорець             | Дія |
@@ -239,14 +368,17 @@ abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --statu
 | `--dry-run`           | Використовує вбудовані тестові відповіді API та окремий `state.dryrun.json`. Створює `report_<дата>_dryrun.html`. Не надсилає сповіщень і не звертається до мережі. Якщо `ips.txt` недоступний для читання, бере зразкові адреси. |
 | `--test-notify`       | Створює зразковий звіт (`report_<дата>_test.html`) і надсилає його в усі налаштовані канали. Стан не змінюється. |
 | `--force-full-report` | Звичайний запуск, але сповіщає про **всі** брудні IP-адреси, включно з `UNCHANGED`. |
-| `--status`            | Показує кількість відстежуваних IP, брудних/чистих, час останнього запуску, кількість звітів, кількість ключів і наступний запуск таймера. |
+| `--status`            | Показує кількість відстежуваних IP, брудних/чистих, час останнього запуску, кількість звітів, кількість ключів, сховище секретів, активні конектори і наступний запуск таймера. |
 | `--reset-state`       | Очищає `state.json` (і стан dry-run). Наступний запуск вважатиме всі брудні IP-адреси `NEW`. |
+| `--edit-secrets`      | Лише root. Розшифрувати в RAM, відредагувати, перевірити, зашифрувати, знищити копію. Див. [Зашифровані секрети](#зашифровані-секрети). |
+| `--encrypt-secrets`   | Лише root. Перенести звичайний `secrets.conf` у зашифроване сховище і знищити оригінал. |
+| `--set-secret KEY`    | Лише root. Задати одну змінну, значення читається зі stdin (воно ніколи не з'являється в `ps`). |
+| `--uninstall`         | Лише root. Інтерактивне меню або `--keep` / `--purge` для скриптів. Див. [Видалення](#видалення). |
 | `--help`, `--version` | Показує довідку або версію. |
 
 Під час ручного запуску використовуйте `sudo abuse-checker ...`, щоб скрипт
-міг прочитати `secrets.conf`. Або запускайте від імені сервісного
-користувача із секретами, які завантажує systemd:
-`sudo systemctl start abuse-checker.service`.
+міг розшифрувати секрети. Або дозвольте systemd запустити його від імені
+сервісного користувача: `sudo systemctl start abuse-checker.service`.
 
 ---
 
@@ -280,28 +412,57 @@ bash tests/run_tests.sh
 sudo ./install.sh
 ```
 
-Інсталятор атомарно замінює виконуваний файл і оновлює юніти та
-`secrets.conf.example`. Ваші налаштування, список IP-адрес і стан
-залишаються без змін. Порівняйте `secrets.conf.example` зі своїм
-`secrets.conf`, щоб знайти нові параметри.
+Інсталятор атомарно замінює виконуваний файл і оновлює юніти, вбудовані
+конектори та `secrets.conf.example`. Ваші секрети, список IP-адрес, стан і
+власні конектори залишаються без змін. Порівняйте `secrets.conf.example` із
+вмістом `sudo abuse-checker --edit-secrets`, щоб знайти нові параметри. Якщо
+ви оновлюєтеся з версії 1.0 зі звичайним `secrets.conf`, завершіть
+оновлення командою `sudo abuse-checker --encrypt-secrets`.
 
 ---
 
 ## Видалення
 
 ```bash
-sudo ./uninstall.sh           # інтерактивно; типово ЗБЕРІГАЄ налаштування і стан
-sudo ./uninstall.sh --keep    # без запитань, зберегти дані в /etc та /var/lib
-sudo ./uninstall.sh --purge   # видалити все, включно із системним користувачем
+sudo abuse-checker --uninstall           # інтерактивне меню
+sudo abuse-checker --uninstall --keep    # для скриптів: те саме, що варіант [1]
+sudo abuse-checker --uninstall --purge   # для скриптів: те саме, що варіант [2]
+sudo ./uninstall.sh [--keep|--purge]     # те саме з робочої копії репозиторію
 ```
 
-Юніти й виконуваний файл видаляються завжди. Користувач `abusechecker`
-видаляється лише тоді, коли видалено обидва каталоги з даними.
+Інтерактивне меню показує кожен шлях, який буде видалено, і його розмір:
+
+```
+  [1] Remove application & systemd timer only (KEEP encrypted secrets, ips.txt, and HTML reports)
+      Removes:
+      /usr/local/bin/abuse-checker                            48K
+      /usr/local/lib/abuse-checker                            24K
+      ...
+  [2] Full Purge (Remove everything including /etc/abuse-checker, /var/lib/abuse-checker, and the 'abusechecker' user)
+      Additionally removes:
+      /etc/abuse-checker                                      20K
+      /var/lib/abuse-checker                                  12K
+  [3] Cancel
+```
+
+[1] — видаляє лише застосунок і таймер systemd, а зашифровані секрети,
+`ips.txt` і HTML-звіти зберігаються. [2] — повне очищення, включно з
+`/etc/abuse-checker`, `/var/lib/abuse-checker` і користувачем
+`abusechecker`. [3] — скасувати (типовий варіант). Повне очищення треба
+підтвердити, ввівши `purge`; перед видаленням каталогів воно знищує майстер-ключ
+і всі незашифровані секрети. Без TTY команда не вгадує: передайте `--keep` або
+`--purge`.
 
 ---
 
 ## Модель безпеки
 
+- **Шифрування на диску.** Секрети зберігаються через `systemd-creds` або
+  AES-256 (OpenSSL, PBKDF2 зі 100 000 ітерацій, випадковий 256-бітний ключ).
+  Відкритий текст існує лише в каналах, у пам'яті процесу або, під час
+  редагування, у файлі з правами `0600` у `/dev/shm`, який потім знищується.
+  Ключ передається в openssl як `-pass file:` і ніколи не потрапляє в
+  командний рядок. Див. [Зашифровані секрети](#зашифровані-секрети).
 - **Жодних секретів у списку процесів.** Кожен виклик `curl` отримує URL і
   заголовки через `curl --config -` зі stdin. API-ключі, токен Telegram (який
   є частиною URL), URL вебхуків Slack та облікові дані SMTP ніколи не
@@ -318,10 +479,14 @@ sudo ./uninstall.sh --purge   # видалити все, включно із с�
   порожній набір capabilities, захист ядра/cgroup та обмежені сімейства
   адрес. Єдиний доступний для запису шлях —
   `ReadWritePaths=/var/lib/abuse-checker`.
-- **Права доступу до файлів.** `secrets.conf` має права `0600 root:root` і
-  читається systemd, а не сервісним користувачем. Скрипт відмовляється
-  підключати його, якщо файл доступний для запису всім. Стан і звіти мають
-  права `0640` і `0750` відповідно.
+- **Права доступу до файлів.** `.master.key` має права `0400 root:root`, а
+  `secrets.cred` — `0600 root:root`. systemd читає обидва файли від root і
+  передає їх сервісу через його приватний каталог облікових даних.
+  Застарілий звичайний `secrets.conf` має бути `0600`, і скрипт
+  відмовляється підключати його, якщо файл доступний для запису всім. Стан і
+  звіти мають права `0640` і `0750` відповідно.
+- **Ізольовані конектори.** Кожен конектор виконується у власній
+  підоболонці після перевірки синтаксису та інтерфейсу.
 - **Безпека HTML.** Кожне значення з API екранується (`@html`) перед
   вставленням у звіт, а сам звіт не завантажує зовнішніх скриптів чи стилів.
 - Одночасно працює лише один екземпляр (`flock` на
@@ -338,7 +503,8 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 Тести працюють повністю офлайн. Вони підміняють `curl` на
 `tests/mock_curl.sh` через змінну `ABUSE_CHECKER_CURL` і спрямовують каталоги
 налаштувань і стану в тимчасовий каталог (`ABUSE_CHECKER_CONF_DIR`,
-`ABUSE_CHECKER_STATE_DIR`). Покриття:
+`ABUSE_CHECKER_STATE_DIR`, `ABUSE_CHECKER_CONNECTORS_DIR`,
+`ABUSE_CHECKER_RAMDIR`, `ABUSE_CHECKER_DROPIN_DIR`). Покриття:
 
 - `bash -n` і `shellcheck` для кожного скрипта;
 - тестові відповіді для чистої IP, щойно забрудненої IP, IP з ескалацією,
@@ -354,7 +520,26 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
   маскуються в логах (включно з імітованими помилками curl) і відсутні в
   стані та звітах;
 - розгортання CIDR, `--dry-run`, `--test-notify`, `--status`, `--reset-state`
-  та видалення старих звітів.
+  та видалення старих звітів;
+- конектори: завантаження з `connectors.d`; файл на 0 байтів, файл лише з
+  пробілами чи коментарями, синтаксична помилка, відсутній інтерфейс,
+  конектор зі збоєм і вимкнений конектор дають попередження або мовчки
+  пропускаються, а інші конектори все одно доставляють сповіщення; власний
+  конектор, створений із шаблону; `ips.txt` лише з коментарями та порожні
+  налаштування конекторів;
+- шифрування: перенесення через `--encrypt-secrets` (заголовок salt,
+  майстер-ключ із 64 шістнадцяткових символів, права `0400`/`0640`,
+  перевірка повного циклу шифрування й розшифрування, drop-in); запуск із
+  зашифрованого сховища; завантаження через `CREDENTIALS_DIRECTORY`;
+  `--set-secret` через stdin; `--edit-secrets` (файл у RAM має права `0600`,
+  зміни шифруються повторно, некоректні правки відхиляються, редагування без
+  змін нічого не робить, файл у RAM знищується); неправильний майстер-ключ
+  перериває запуск; openssl ніколи не отримує секретів в argv; у каталогах
+  налаштувань, стану, RAM і tmp не лишається відкритих секретів; а також рівень
+  `systemd-creds`, якщо він доступний;
+- `--uninstall` у фіктивному корені: текст меню та шляхи, скасування, `[1]`,
+  `[2]` з введеним підтвердженням і без нього, відмова без TTY, а також
+  обгортка `uninstall.sh`.
 
 ---
 
@@ -362,7 +547,13 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 
 | Симптом | Рішення |
 |---------|---------|
-| `ABUSEIPDB_API_KEYS is not configured` | Додайте ключ у `secrets.conf`. Ручні перевірки запускайте через `sudo`. |
+| `ABUSEIPDB_API_KEYS is not configured` | Додайте ключ через `sudo abuse-checker --edit-secrets`. Ручні перевірки запускайте через `sudo`. |
+| `secrets are encrypted but the master key is not readable` | Запускайте через `sudo` або через systemd (`systemctl start abuse-checker`). |
+| `cannot decrypt ... (wrong or missing master key?)` | `.master.key` не відповідає `secrets.conf.enc`. Відновіть обидва файли з резервної копії або видаліть `.enc` і введіть секрети знову через `--edit-secrets`. |
+| `secrets are stored in plain text` | Виконайте `sudo abuse-checker --encrypt-secrets`. |
+| `RAM directory /dev/shm not available` | Змонтуйте tmpfs у `/dev/shm` або вкажіть інший каталог tmpfs у `ABUSE_CHECKER_RAMDIR`. |
+| `connector X: ... skipped` | Цей файл у `connectors.d` порожній, містить синтаксичну помилку або не має `connector_enabled`/`connector_send`. Виправте або видаліть його. |
+| `no connector delivered the alert` | Жоден конектор не налаштовано. Перевірте рядок `Connectors` у `--status`, потім виконайте `--edit-secrets`. |
 | `IP list not readable` | Перевірте, що `ips.txt` існує і має права `0644 root:abusechecker`. Повторний запуск `install.sh` виправить права. |
 | `state directory ... does not exist` | Виконайте `sudo ./install.sh`. |
 | `another abuse-checker instance is running` | Триває інший запуск або блокування утримує запущений процес. Перевірте `systemctl status abuse-checker`. |
@@ -374,13 +565,13 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | Пошта не доставляється | Перевірте `SMTP_URL`, порт і облікові дані. Для Gmail використовуйте пароль застосунку. Без `SMTP_URL` потрібен робочий локальний `sendmail`. |
 | Сповіщень немає взагалі | Це нормально, поки нічого не змінюється. Перевірте через `--force-full-report` або `--test-notify`. |
 | Забагато сповіщень `NEW` після скидання | Очікувано: `--reset-state` стирає історію. |
-| systemd ігнорує значення з `secrets.conf` | Приберіть розгортання `$var` і ключові слова `export`. Використовуйте лише `KEY="value"`. |
+| `--edit-secrets` повідомляє `invalid line(s)` | Використовуйте `KEY="value"` або `KEY='value'` без `$(...)`, зворотних лапок і `;`. |
 | Пошкоджений `state.json` | Скрипт запише попередження в лог і автоматично почне з чистого стану. Також можна виконати `--reset-state`. |
 
 Налагодження запуску в інтерактивному режимі із середовищем сервісу:
 
 ```bash
 sudo systemd-run --pty --wait -p User=abusechecker \
-  -p EnvironmentFile=/etc/abuse-checker/secrets.conf \
+  -p LoadCredential=master.key:/etc/abuse-checker/.master.key \
   -p ReadWritePaths=/var/lib/abuse-checker /usr/local/bin/abuse-checker --run
 ```

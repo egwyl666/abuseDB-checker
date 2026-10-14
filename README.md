@@ -20,6 +20,8 @@ at once.
 - [File locations (FHS)](#file-locations-fhs)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Encrypted secrets](#encrypted-secrets)
+- [Connectors](#connectors)
 - [Managing IPs and recipients](#managing-ips-and-recipients)
 - [CLI reference](#cli-reference)
 - [Daily maintenance](#daily-maintenance)
@@ -87,24 +89,33 @@ from outside (about 6–15 KB for typical pools). It contains:
 
 ## File locations (FHS)
 
-| Path                                         | Mode   | Owner                       | Purpose                                     |
-|----------------------------------------------|--------|-----------------------------|---------------------------------------------|
-| `/usr/local/bin/abuse-checker`               | `0755` | `root:root`                 | Main executable (in `$PATH`)                |
-| `/etc/abuse-checker/secrets.conf`            | `0600` | `root:root`                 | API keys, tokens, webhooks, SMTP, settings  |
-| `/etc/abuse-checker/secrets.conf.example`    | `0644` | `root:root`                 | Reference copy of every setting             |
-| `/etc/abuse-checker/ips.txt`                 | `0644` | `root:abusechecker`         | IPs and CIDRs to monitor                    |
-| `/var/lib/abuse-checker/state.json`          | `0640` | `abusechecker:abusechecker` | Diff state database                         |
-| `/var/lib/abuse-checker/state.dryrun.json`   | `0640` | `abusechecker:abusechecker` | Separate state used by `--dry-run`          |
-| `/var/lib/abuse-checker/reports/`            | `0750` | `abusechecker:abusechecker` | Generated `.html` reports                   |
-| `/etc/systemd/system/abuse-checker.service`  | `0644` | `root:root`                 | Sandboxed oneshot service                   |
-| `/etc/systemd/system/abuse-checker.timer`    | `0644` | `root:root`                 | Daily trigger (06:00 + up to 15 min jitter) |
-| `/usr/local/share/doc/abuse-checker/`        | `0755` | `root:root`                 | This README                                 |
+| Path                                                   | Mode   | Owner                       | Purpose                                         |
+|--------------------------------------------------------|--------|-----------------------------|-------------------------------------------------|
+| `/usr/local/bin/abuse-checker`                         | `0755` | `root:root`                 | Main executable (in `$PATH`)                    |
+| `/usr/local/lib/abuse-checker/connectors.d/`           | `0755` | `root:root`                 | Notification connectors (`*.sh`, run in order)  |
+| `/etc/abuse-checker/secrets.conf.enc`                  | `0640` | `root:abusechecker`         | Secrets, AES-256 encrypted (OpenSSL tier)       |
+| `/etc/abuse-checker/.master.key`                       | `0400` | `root:root`                 | Random 256-bit key for the OpenSSL tier         |
+| `/etc/abuse-checker/secrets.cred`                      | `0600` | `root:root`                 | Secrets encrypted with `systemd-creds` (tier 1) |
+| `/etc/abuse-checker/secrets.conf`                      | `0600` | `root:root`                 | *Legacy* plain text; migrate with `--encrypt-secrets` |
+| `/etc/abuse-checker/secrets.conf.example`              | `0644` | `root:root`                 | Reference copy of every setting                 |
+| `/etc/abuse-checker/ips.txt`                           | `0644` | `root:abusechecker`         | IPs and CIDRs to monitor                        |
+| `/var/lib/abuse-checker/state.json`                    | `0640` | `abusechecker:abusechecker` | Diff state database                             |
+| `/var/lib/abuse-checker/state.dryrun.json`             | `0640` | `abusechecker:abusechecker` | Separate state used by `--dry-run`              |
+| `/var/lib/abuse-checker/reports/`                      | `0750` | `abusechecker:abusechecker` | Generated `.html` reports                       |
+| `/etc/systemd/system/abuse-checker.service`            | `0644` | `root:root`                 | Sandboxed oneshot service                       |
+| `/etc/systemd/system/abuse-checker.service.d/10-secrets.conf` | `0644` | `root:root`          | Generated: how systemd hands secrets to the service |
+| `/etc/systemd/system/abuse-checker.timer`              | `0644` | `root:root`                 | Daily trigger (06:00 + up to 15 min jitter)     |
+| `/usr/local/share/doc/abuse-checker/`                  | `0755` | `root:root`                 | README files                                    |
+
+Only one of `secrets.cred`, `secrets.conf.enc` or `secrets.conf` exists at a
+time.
 
 Repository layout:
 
 ```
 abuse-checker.sh            main script (installed as /usr/local/bin/abuse-checker)
-install.sh / uninstall.sh   installer and remover
+connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 99-custom.sh.example
+install.sh / uninstall.sh   installer (with setup wizard) and remover
 systemd/                    service and timer units
 config/                     secrets.conf.example, ips.txt.example
 tests/run_tests.sh          offline test suite (uses tests/mock_curl.sh)
@@ -114,30 +125,56 @@ tests/run_tests.sh          offline test suite (uses tests/mock_curl.sh)
 
 ## Installation
 
-Requirements: a systemd-based Linux, Bash 4.4+, `curl` 7.55+ and `jq` 1.6+.
+Requirements: a systemd-based Linux, Bash 4.4+, `curl` 7.55+, `jq` 1.6+ and
+`openssl` (systemd 250+ is used automatically when available).
 
 ```bash
 # Debian/Ubuntu
-sudo apt install -y curl jq
+sudo apt install -y curl jq openssl
 # RHEL/Alma/Rocky/Fedora
-sudo dnf install -y curl jq
+sudo dnf install -y curl jq openssl
 
 git clone <this repo> abuse-checker && cd abuse-checker
 bash tests/run_tests.sh          # optional: run the offline test suite first
-sudo ./install.sh                # creates user, dirs, units; enables the timer
+sudo ./install.sh                # creates user, dirs, units, encrypted store; enables the timer
 ```
 
-`install.sh` is idempotent. It **never overwrites** an existing
-`secrets.conf`, `ips.txt` or `state.json`; it only corrects their ownership and
-permissions. Use `--no-enable` to install without starting the timer.
+`install.sh` is idempotent. It **never overwrites** existing secrets,
+`ips.txt` or `state.json`; it only corrects their ownership and permissions.
+Options:
+
+- `--no-enable`: install without starting the timer;
+- `--non-interactive` (`-n`): never show the setup wizard (also skipped
+  automatically when there is no TTY, e.g. in Ansible or cloud-init).
+
+### Setup wizard
+
+At the end of an interactive install you are asked:
+
+```
+Would you like to configure API keys and notification connectors now? [y/N]
+(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets')
+```
+
+Pressing Enter skips it. If you answer `y`, it walks through four optional
+steps. Press Enter at any prompt to skip that step:
+
+1. AbuseIPDB API key(s)
+2. Telegram connector (bot token + chat IDs)
+3. Slack connector (webhook URLs)
+4. Email connector (recipients + SMTP URL/user/password)
+
+Tokens and passwords are typed without echo. Each value goes straight into the
+encrypted store through `abuse-checker --set-secret` on stdin, so no plaintext
+file is ever written. At the end the wizard offers to run `--test-notify`.
 
 Then:
 
 ```bash
-sudo editor /etc/abuse-checker/secrets.conf   # at least ABUSEIPDB_API_KEYS
+sudo abuse-checker --edit-secrets              # if you skipped the wizard
 sudo editor /etc/abuse-checker/ips.txt
 sudo abuse-checker --dry-run                   # mock data, checks the pipeline
-sudo abuse-checker --test-notify               # sends a test alert to every channel
+sudo abuse-checker --test-notify               # sends a test alert to every connector
 sudo systemctl start abuse-checker.service     # first real run
 journalctl -u abuse-checker -n 50 --no-pager
 ```
@@ -149,10 +186,11 @@ journalctl -u abuse-checker -n 50 --no-pager
 
 ## Configuration
 
-Everything lives in `/etc/abuse-checker/secrets.conf`. systemd reads it via
-`EnvironmentFile=`, and the script sources it when run as root. Write plain
-`KEY="value"` lines only: no `$variables` and no command substitution, because
-systemd does not expand them.
+All settings live in the encrypted secrets store (see
+[Encrypted secrets](#encrypted-secrets)). Change them with
+`sudo abuse-checker --edit-secrets`. Write plain `KEY="value"` or
+`KEY='value'` lines only: no `$variables` and no command substitution. The
+editor refuses anything else.
 
 | Variable              | Default         | Description                                                      |
 |-----------------------|-----------------|------------------------------------------------------------------|
@@ -200,13 +238,16 @@ need to restart anything; the next run picks up the change.
 
 ### Recipients
 
-All of these settings take comma-separated lists. Edit `secrets.conf`, then
-check delivery:
+All of these settings take comma-separated lists. Edit the encrypted store,
+then check delivery:
 
 ```bash
-sudo editor /etc/abuse-checker/secrets.conf
+sudo abuse-checker --edit-secrets
 sudo abuse-checker --test-notify
 ```
+
+An empty setting simply disables its connector. To remove a team, delete it
+from the list. To add a new channel type, see [Connectors](#connectors).
 
 - **Telegram:** create a bot with @BotFather and add it to each group.
   To find chat ids, send the bot a message and open
@@ -221,10 +262,93 @@ sudo abuse-checker --test-notify
 
 ---
 
+## Encrypted secrets
+
+Secrets are encrypted at rest. The tier is detected automatically when
+secrets are first stored:
+
+| Tier | When | Files | How the service gets them |
+|------|------|-------|---------------------------|
+| 1. `systemd-creds` | systemd ≥ 250 is running and `systemd-creds encrypt` works (TPM2 and/or host key) | `secrets.cred` | `LoadCredentialEncrypted=secrets:...`. systemd decrypts into the service's private, non-swappable credentials directory. |
+| 2. OpenSSL | everywhere else | `secrets.conf.enc` + `.master.key` | `LoadCredential=master.key:...`. The service decrypts with `openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000` into memory (a pipe) and sources it. |
+| Legacy | a plain `secrets.conf` you placed yourself | `secrets.conf` | `EnvironmentFile=`. Still works, but logs a warning on every run. |
+
+The matching systemd drop-in, `abuse-checker.service.d/10-secrets.conf`, is
+rewritten automatically whenever the store changes. You can force a tier with
+`ABUSE_CHECKER_CRYPTO=openssl|systemd`.
+
+```bash
+sudo abuse-checker --edit-secrets      # decrypt -> /dev/shm (0600) -> $EDITOR -> validate -> re-encrypt -> shred
+sudo abuse-checker --encrypt-secrets   # migrate plain secrets.conf, then shred it
+printf '%s\n' "$VALUE" | sudo abuse-checker --set-secret SLACK_WEBHOOK_URLS   # scripted, value via stdin
+```
+
+How `--edit-secrets` works:
+
+- The decrypted copy exists only as a `0600` file in `/dev/shm`, which is RAM.
+  If `/dev/shm` is unavailable, the command refuses to run rather than fall
+  back to disk.
+- It uses `$VISUAL`, then `$EDITOR`, then `nano`, then `vi`.
+- When you exit the editor, the file is checked: only comments and
+  `KEY="value"` lines are allowed, and `bash -n` must pass. If the check
+  fails, you can re-open the editor. If you give up, nothing changes.
+- The new ciphertext is verified by decrypting it again before it replaces the
+  old file. The RAM copy is then shredded, including on errors and Ctrl-C.
+- If you saved without changes, nothing is re-encrypted.
+
+Back up `.master.key` (or the host's systemd credential key) together with
+`secrets.conf.enc`. Without the key the secrets cannot be recovered, and the
+run aborts with `cannot decrypt` instead of running with an empty
+configuration.
+
+---
+
+## Connectors
+
+Notifications are delivered by modules in
+`/usr/local/lib/abuse-checker/connectors.d/` (or `connectors/` when running
+from a source checkout). Every `*.sh` file runs in name order, each **in its
+own subshell**, so one failing connector cannot stop the others or the run.
+
+| File | Settings |
+|------|----------|
+| `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
+| `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
+| `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
+| `99-custom.sh.example` | Documented template. Not loaded, because it does not end in `.sh`. |
+
+A connector defines two functions:
+
+```bash
+connector_enabled   # return 0 when its settings are present; otherwise it is skipped silently
+connector_send      # $1 = classified JSON, $2 = report.html, $3 = title; non-zero = failure (logged)
+```
+
+Files that could break a run are skipped with a warning, and the remaining
+connectors still run. A file is skipped when it:
+
+1. is empty (0 bytes) or contains only whitespace and comments;
+2. fails `bash -n`;
+3. does not define both `connector_enabled` and `connector_send` after being
+   sourced in a test subshell.
+
+To add a connector, run
+`sudo install -m 0644 99-custom.sh.example /usr/local/lib/abuse-checker/connectors.d/40-mywebhook.sh`.
+Edit it, add its settings with `--edit-secrets`, and check it with
+`abuse-checker --status` (the `Connectors` line) and `--test-notify`.
+Connectors can use the built-in helpers `secure_curl`, `cfg_line`,
+`split_csv`, `plain_summary`, `info` and `warn`. Any setting whose name
+contains `TOKEN`, `_KEY`, `PASS`, `SECRET` or `WEBHOOK` is redacted from the
+logs automatically. The installer updates the bundled connectors and leaves
+yours untouched.
+
+---
+
 ## CLI reference
 
 ```
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
+abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
 ```
 
 | Flag                  | Effect |
@@ -233,12 +357,16 @@ abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --statu
 | `--dry-run`           | Use built-in mock API responses and a separate `state.dryrun.json`. Writes `report_<date>_dryrun.html`. Sends no notifications and makes no network calls. Uses the sample targets if `ips.txt` is not readable. |
 | `--test-notify`       | Build a sample report (`report_<date>_test.html`) and send it to every configured channel. Does not touch the state. |
 | `--force-full-report` | Normal run, but alerts on **every** dirty IP, including `UNCHANGED` ones. |
-| `--status`            | Shows tracked IPs, dirty/clean counts, last run, report count, number of keys and the next timer trigger. |
+| `--status`            | Shows tracked IPs, dirty/clean counts, last run, report count, number of keys, the secrets store, the active connectors and the next timer trigger. |
 | `--reset-state`       | Clears `state.json` (and the dry-run state). The next run treats every dirty IP as `NEW`. |
+| `--edit-secrets`      | Root only. Decrypt into RAM, edit, validate, re-encrypt, shred. See [Encrypted secrets](#encrypted-secrets). |
+| `--encrypt-secrets`   | Root only. Move a plain-text `secrets.conf` into the encrypted store and shred the original. |
+| `--set-secret KEY`    | Root only. Set one variable, reading the value from stdin (it never appears in `ps`). |
+| `--uninstall`         | Root only. Interactive menu, or `--keep` / `--purge` for scripts. See [Uninstalling](#uninstalling). |
 | `--help`, `--version` | Show usage or the version. |
 
-When run by hand, use `sudo abuse-checker ...` so the script can read
-`secrets.conf`. Or run it as the service user, with the secrets loaded by systemd:
+When run by hand, use `sudo abuse-checker ...` so the script can decrypt the
+secrets. Or let systemd run it as the service user:
 `sudo systemctl start abuse-checker.service`.
 
 ---
@@ -272,27 +400,53 @@ bash tests/run_tests.sh
 sudo ./install.sh
 ```
 
-The installer replaces the binary atomically and refreshes the units and
-`secrets.conf.example`. Your config, IP list and state are left alone. Compare
-`secrets.conf.example` with your `secrets.conf` to find new settings.
+The installer replaces the binary atomically and refreshes the units, the
+bundled connectors and `secrets.conf.example`. Your secrets, IP list, state
+and custom connectors are left alone. Compare `secrets.conf.example` with
+`sudo abuse-checker --edit-secrets` to find new settings. If you upgrade from
+1.0 with a plain `secrets.conf`, finish with
+`sudo abuse-checker --encrypt-secrets`.
 
 ---
 
 ## Uninstalling
 
 ```bash
-sudo ./uninstall.sh           # interactive; defaults to KEEPING config and state
-sudo ./uninstall.sh --keep    # non-interactive, keep /etc and /var/lib data
-sudo ./uninstall.sh --purge   # remove everything including the system user
+sudo abuse-checker --uninstall           # interactive menu
+sudo abuse-checker --uninstall --keep    # scripted: same as option [1]
+sudo abuse-checker --uninstall --purge   # scripted: same as option [2]
+sudo ./uninstall.sh [--keep|--purge]     # same thing, from the source checkout
 ```
 
-The units and the binary are always removed. The `abusechecker` user is only
-deleted when both data directories are deleted too.
+The interactive menu lists every path that would be removed, with its size:
+
+```
+  [1] Remove application & systemd timer only (KEEP encrypted secrets, ips.txt, and HTML reports)
+      Removes:
+      /usr/local/bin/abuse-checker                            48K
+      /usr/local/lib/abuse-checker                            24K
+      ...
+  [2] Full Purge (Remove everything including /etc/abuse-checker, /var/lib/abuse-checker, and the 'abusechecker' user)
+      Additionally removes:
+      /etc/abuse-checker                                      20K
+      /var/lib/abuse-checker                                  12K
+  [3] Cancel
+```
+
+The default is `[3] Cancel`. A purge must be confirmed by typing `purge`, and
+it shreds the master key and any plain-text secrets before deleting the
+directories. Without a TTY the command refuses to guess; pass `--keep` or
+`--purge`.
 
 ---
 
 ## Security model
 
+- **Encrypted at rest.** Secrets are stored with `systemd-creds` or AES-256
+  (OpenSSL, PBKDF2 with 100,000 iterations, random 256-bit key). Plaintext
+  only exists in pipes, in process memory, or in a shredded `0600` file in
+  `/dev/shm` while you edit. The key is passed to openssl as `-pass file:` and
+  never on the command line. See [Encrypted secrets](#encrypted-secrets).
 - **No secrets in the process list.** Every `curl` call gets its URL and
   headers through `curl --config -` on stdin. API keys, the Telegram token
   (which is part of the URL), Slack webhook URLs and SMTP credentials never
@@ -308,9 +462,13 @@ deleted when both data directories are deleted too.
   `ProtectHome`, `PrivateTmp` and `PrivateDevices`, an empty capability set,
   kernel/cgroup protections and restricted address families. The only writable
   path is `ReadWritePaths=/var/lib/abuse-checker`.
-- **File permissions.** `secrets.conf` is `0600 root:root` and is read by
-  systemd, not by the service user. The script refuses to source it if it is
-  world-writable. State and reports are `0640` and `0750` respectively.
+- **File permissions.** `.master.key` is `0400 root:root` and
+  `secrets.cred` is `0600 root:root`. systemd reads both as root and hands
+  them to the service through its private credentials directory. A legacy
+  plain `secrets.conf` must be `0600`, and the script refuses to source it if
+  it is world-writable. State and reports are `0640` and `0750` respectively.
+- **Isolated connectors.** Each connector runs in its own subshell, after
+  syntax and interface checks.
 - **HTML safety.** Every value from the API is HTML-escaped (`@html`) before
   it goes into the report, and the report loads no external scripts or
   stylesheets.
@@ -327,7 +485,8 @@ bash tests/run_tests.sh          # KEEP_WORK=1 keeps the temp dir for inspection
 The suite runs fully offline. It replaces `curl` with `tests/mock_curl.sh`
 through the `ABUSE_CHECKER_CURL` variable, and points the config and state
 directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
-`ABUSE_CHECKER_STATE_DIR`). It covers:
+`ABUSE_CHECKER_STATE_DIR`, `ABUSE_CHECKER_CONNECTORS_DIR`,
+`ABUSE_CHECKER_RAMDIR`, `ABUSE_CHECKER_DROPIN_DIR`). It covers:
 
 - `bash -n` and `shellcheck` on every script;
 - mocked responses for a clean IP, a newly dirty IP, an escalating IP, an
@@ -342,7 +501,23 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 - secrets: never in curl argv, always in the stdin config, scrubbed from logs
   (including simulated curl errors), and absent from state and reports;
 - CIDR expansion, `--dry-run`, `--test-notify`, `--status`, `--reset-state`
-  and report retention.
+  and report retention;
+- connectors: loading from `connectors.d`; a 0-byte file, a whitespace- or
+  comment-only file, a syntax error, a missing interface, a failing connector
+  and a disabled connector each give a warning or a silent skip while the other
+  connectors still deliver; a custom connector built from the template;
+  comment-only `ips.txt` and empty connector settings;
+- encryption: `--encrypt-secrets` migration (salt header, 64-hex master key,
+  `0400`/`0640` modes, round trip, drop-in); running from the encrypted store;
+  loading through `CREDENTIALS_DIRECTORY`; `--set-secret` through stdin;
+  `--edit-secrets` (the RAM file is `0600`, the edit is re-encrypted,
+  invalid edits are rejected, unchanged edits are a no-op, the RAM file is
+  shredded); a wrong master key aborts; openssl never sees a secret in argv;
+  no plaintext secret is left in the config, state, RAM or tmp directories;
+  and the `systemd-creds` tier when available;
+- `--uninstall` in a fake root: the menu text and paths, cancel, `[1]`,
+  `[2]` with and without typed confirmation, refusal without a TTY, and the
+  `uninstall.sh` wrapper.
 
 ---
 
@@ -350,7 +525,13 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 
 | Symptom | Fix |
 |---------|-----|
-| `ABUSEIPDB_API_KEYS is not configured` | Add a key to `secrets.conf`. Run manual checks with `sudo`. |
+| `ABUSEIPDB_API_KEYS is not configured` | Add a key with `sudo abuse-checker --edit-secrets`. Run manual checks with `sudo`. |
+| `secrets are encrypted but the master key is not readable` | Run with `sudo`, or through systemd (`systemctl start abuse-checker`). |
+| `cannot decrypt ... (wrong or missing master key?)` | `.master.key` does not match `secrets.conf.enc`. Restore both from backup, or remove the `.enc` file and re-enter the secrets with `--edit-secrets`. |
+| `secrets are stored in plain text` | Run `sudo abuse-checker --encrypt-secrets`. |
+| `RAM directory /dev/shm not available` | Mount tmpfs on `/dev/shm`, or set `ABUSE_CHECKER_RAMDIR` to another tmpfs directory. |
+| `connector X: ... skipped` | That file in `connectors.d` is empty, has a syntax error, or lacks `connector_enabled`/`connector_send`. Fix or delete it. |
+| `no connector delivered the alert` | No connector is configured. Run `--status` and check the `Connectors` line, then `--edit-secrets`. |
 | `IP list not readable` | Check that `ips.txt` exists and is `0644 root:abusechecker`. Re-running `install.sh` fixes the permissions. |
 | `state directory ... does not exist` | Run `sudo ./install.sh`. |
 | `another abuse-checker instance is running` | A run is in progress, or a stale lock is held by a running process. Check with `systemctl status abuse-checker`. |
@@ -362,13 +543,13 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | Email not delivered | Check `SMTP_URL`, the port and the credentials. For Gmail, use an app password. Without `SMTP_URL`, a working local `sendmail` is required. |
 | No alerts ever | That is expected while nothing changes. Check with `--force-full-report` or `--test-notify`. |
 | Too many `NEW` alerts after a reset | Expected: `--reset-state` forgets history. |
-| `secrets.conf` values ignored by systemd | Remove `$var` expansions and `export` keywords. Use `KEY="value"` only. |
+| `--edit-secrets` reports `invalid line(s)` | Use `KEY="value"` or `KEY='value'`, with no `$(...)`, backticks or `;`. |
 | Corrupt `state.json` | The script logs a warning and starts fresh automatically. You can also run `--reset-state`. |
 
 Debug a run in the foreground with the service's environment:
 
 ```bash
 sudo systemd-run --pty --wait -p User=abusechecker \
-  -p EnvironmentFile=/etc/abuse-checker/secrets.conf \
+  -p LoadCredential=master.key:/etc/abuse-checker/.master.key \
   -p ReadWritePaths=/var/lib/abuse-checker /usr/local/bin/abuse-checker --run
 ```

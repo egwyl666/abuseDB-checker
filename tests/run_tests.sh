@@ -53,6 +53,13 @@ EOF
     export MOCK_FIX="$WORK/env/fix" MOCK_LOG="$WORK/env/log"
     export MOCK_LIMITED_KEYS="$KEY_LIMITED"
     unset MOCK_LEAK USE_CHECK_BLOCK
+    mkdir -p "$WORK/env/connectors.d" "$WORK/env/shm" "$WORK/env/tmp" "$WORK/env/dropin"
+    cp "$ROOT"/connectors/*.sh "$WORK/env/connectors.d/"
+    export ABUSE_CHECKER_CONNECTORS_DIR="$WORK/env/connectors.d"
+    export ABUSE_CHECKER_RAMDIR="$WORK/env/shm"
+    export ABUSE_CHECKER_DROPIN_DIR="$WORK/env/dropin"
+    export ABUSE_CHECKER_CRYPTO=openssl
+    export TMPDIR="$WORK/env/tmp"
 }
 
 fix_ip() { # ip score total last
@@ -74,10 +81,11 @@ report_file() { echo "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date '+%Y-%m-%d'
 
 # ---------------------------------------------------------------------------
 section "Static checks"
-for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh; do
+for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh \
+         connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/99-custom.sh.example; do
     if bash -n "$ROOT/$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; fi
     if command -v shellcheck >/dev/null 2>&1; then
-        if shellcheck -x "$ROOT/$f" >/dev/null 2>&1; then ok "shellcheck $f"; else bad "shellcheck $f" "$(shellcheck "$ROOT/$f" | head -5)"; fi
+        if shellcheck -s bash -x "$ROOT/$f" >/dev/null 2>&1; then ok "shellcheck $f"; else bad "shellcheck $f" "$(shellcheck -s bash "$ROOT/$f" | head -5)"; fi
     fi
 done
 
@@ -249,6 +257,212 @@ echo x > "$old"; touch -d '40 days ago' "$old"
 fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
 run_checker --run
 check "reports older than RETENTION_DAYS deleted" test ! -e "$old"
+
+# ---------------------------------------------------------------------------
+section "Connectors: modular loading and broken-file guards"
+setup_env
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+CD="$ABUSE_CHECKER_CONNECTORS_DIR"
+: > "$CD/05-empty.sh"                                          # 0 bytes
+printf '   \n\t\n# just a comment\n   # another\n\n' > "$CD/06-blank.sh"
+printf 'connector_enabled() { true; }\nconnector_send() { if then; }\n' > "$CD/07-broken.sh"
+printf 'SOME_SETTING=1\nhelper() { :; }\n' > "$CD/08-noiface.sh"
+printf 'connector_enabled() { true; }\nconnector_send() { echo boom >&2; return 1; }\n' > "$CD/15-failing.sh"
+printf 'connector_enabled() { [[ -n "${NOT_CONFIGURED_VAR:-}" ]]; }\nconnector_send() { echo SHOULD-NOT-RUN; }\n' > "$CD/25-disabled.sh"
+cp "$ROOT/connectors/99-custom.sh.example" "$CD/40-custom.sh"
+cp "$ROOT/connectors/99-custom.sh.example" "$CD/99-custom.sh.example"   # not *.sh: ignored
+CUSTOM_URL="https://hooks.slack.test/custom/dummyCustomSecret777"
+echo "CUSTOM_WEBHOOK_URL=\"$CUSTOM_URL\"" >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+run_checker --run
+check "run survives broken connectors (rc 0)" test "$RC" -eq 0
+check "warns: empty file" grep -q "05-empty.sh: empty file; skipped" <<< "$OUT"
+check "warns: whitespace/comment-only file" grep -q "06-blank.sh: only comments/whitespace; skipped" <<< "$OUT"
+check "warns: syntax error file" grep -q "07-broken.sh: syntax error (bash -n failed); skipped" <<< "$OUT"
+check "warns: missing interface" grep -q "08-noiface.sh: missing connector_enabled/connector_send; skipped" <<< "$OUT"
+check "failing connector logged, others continue" grep -q "connector 15-failing failed" <<< "$OUT"
+check "unconfigured connector silently skipped" bash -c '! grep -q SHOULD-NOT-RUN <<< "$1"' _ "$OUT"
+check "*.example template not loaded" bash -c '! grep -q "99-custom" <<< "$1"' _ "$OUT"
+check "Telegram still delivered" grep -q '/sendDocument' "$MOCK_LOG/notify.log"
+check "Slack still delivered" grep -q 'hooks.slack.test/services' "$MOCK_LOG/notify.log"
+check "Email still delivered" grep -q '^smtps://' "$MOCK_LOG/notify.log"
+check "custom connector (from template) delivered" grep -q 'hooks.slack.test/custom' "$MOCK_LOG/notify.log"
+check "custom connector payload valid" bash -c 'grep -q "\"alerts\"" "$1"' _ "$MOCK_LOG/slack_payload.log"
+check "custom *WEBHOOK* secret redacted from logs" bash -c '! grep -qF "$1" <<< "$2"' _ "$CUSTOM_URL" "$OUT"
+check "custom secret not in curl argv" bash -c '! grep -qF "$1" "$2"' _ "$CUSTOM_URL" "$MOCK_LOG/argv.log"
+run_checker --status
+check "--status lists valid connectors" grep -q "Connectors  : 10-telegram 15-failing 20-slack 25-disabled 30-email 40-custom" <<< "$OUT"
+rm -f "$CD"/*.sh
+run_checker --run
+check "no connectors at all: still rc 0" test "$RC" -eq 0
+
+section "Empty ips.txt and empty connector variables"
+setup_env
+printf '# nothing here\n\n   \n# 192.0.2.1\n' > "$ABUSE_CHECKER_CONF_DIR/ips.txt"
+run_checker --run
+check "comment-only ips.txt: rc 0" test "$RC" -eq 0
+check "comment-only ips.txt: warning" grep -q "no valid targets" <<< "$OUT"
+setup_env
+printf 'ABUSEIPDB_API_KEYS="%s"\nTELEGRAM_BOT_TOKEN=""\nTELEGRAM_CHAT_IDS=""\nSLACK_WEBHOOK_URLS=""\nEMAIL_TO=""\n' "$KEY_GOOD" \
+    > "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "empty connector vars: rc 0" test "$RC" -eq 0
+check "empty connector vars: nothing sent" test ! -s "$MOCK_LOG/notify.log"
+check "empty connector vars: warning" grep -q "no connector delivered" <<< "$OUT"
+
+# ---------------------------------------------------------------------------
+section "Encrypted secrets (OpenSSL tier)"
+setup_env
+# openssl shim: records argv, then runs the real binary.
+mkdir -p "$WORK/bin"
+REAL_OPENSSL="$(command -v openssl)"
+printf '#!/usr/bin/env bash\nprintf "%%q " "$@" >> "%s"; echo >> "%s"\nexec "%s" "$@"\n' \
+    "$WORK/openssl_argv.log" "$WORK/openssl_argv.log" "$REAL_OPENSSL" > "$WORK/bin/openssl"
+chmod +x "$WORK/bin/openssl"
+: > "$WORK/openssl_argv.log"
+OLDPATH="$PATH"; export PATH="$WORK/bin:$PATH"
+C="$ABUSE_CHECKER_CONF_DIR"
+dec() { "$REAL_OPENSSL" enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256 -d -pass "file:$C/.master.key" -in "$C/secrets.conf.enc"; }
+no_plain_leaks() { # every secret is absent from all files in conf/state/ram/tmp
+    local s
+    for s in "${ALL_SECRETS[@]}"; do
+        grep -rqaF -- "$s" "$C" "$ABUSE_CHECKER_STATE_DIR" "$ABUSE_CHECKER_RAMDIR" "$TMPDIR" 2>/dev/null && return 1
+    done
+    return 0
+}
+
+run_checker --run
+check "legacy plain secrets.conf still loads" grep -q "API key #1 rate-limited" <<< "$OUT"
+check "legacy plain secrets.conf warns" grep -q "run 'sudo abuse-checker --encrypt-secrets'" <<< "$OUT"
+run_checker --encrypt-secrets
+check "--encrypt-secrets rc 0" test "$RC" -eq 0
+check "plain secrets.conf removed" test ! -e "$C/secrets.conf"
+check "secrets.conf.enc created" test -s "$C/secrets.conf.enc"
+check "ciphertext has OpenSSL salt header" bash -c 'head -c 8 "$1" | grep -q Salted__' _ "$C/secrets.conf.enc"
+check "master key is 256-bit hex" bash -c '[[ "$(tr -d "\n" < "$1")" =~ ^[0-9a-f]{64}$ ]]' _ "$C/.master.key"
+check "master key mode 0400" test "$(stat -c %a "$C/.master.key")" = "400"
+check "encrypted file mode 0640" test "$(stat -c %a "$C/secrets.conf.enc")" = "640"
+check "decrypts back to the original" bash -c 'grep -qF "$1" <<< "$2"' _ "TELEGRAM_BOT_TOKEN=\"$TG_TOKEN\"" "$(dec)"
+check "drop-in uses LoadCredential for master key" grep -q "^LoadCredential=master.key:$C/.master.key" "$ABUSE_CHECKER_DROPIN_DIR/10-secrets.conf"
+check "no plaintext secret left on disk/RAM/tmp" no_plain_leaks
+: > "$MOCK_LOG/notify.log"; : > "$MOCK_LOG/keys_used.log"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --reset-state
+run_checker --run
+check "run with encrypted store: rc 0" test "$RC" -eq 0
+check "run with encrypted store: no plain warning" bash -c '! grep -q "plain text" <<< "$1"' _ "$OUT"
+check "run with encrypted store: API key used" grep -qF "$KEY_GOOD" "$MOCK_LOG/keys_used.log"
+check "run with encrypted store: alerts sent" grep -q sendMessage "$MOCK_LOG/notify.log"
+run_checker --status
+check "--status reports openssl store" grep -q "Secrets     : openssl store" <<< "$OUT"
+check "no plaintext secret left after run" no_plain_leaks
+
+# Service-style load: master key handed over via $CREDENTIALS_DIRECTORY.
+mkdir -p "$WORK/creds"; cp "$C/.master.key" "$WORK/creds/master.key"
+mv "$C/.master.key" "$WORK/master.bak"
+CREDENTIALS_DIRECTORY="$WORK/creds" run_checker --status
+check "loads via CREDENTIALS_DIRECTORY/master.key (LoadCredential)" grep -q "API keys    : 2 configured" <<< "$OUT"
+run_checker --status
+check "missing master key: warns, no crash" grep -q "master key is not readable" <<< "$OUT"
+mv "$WORK/master.bak" "$C/.master.key"
+
+# --set-secret: value via stdin, never argv.
+NEW_TOKEN="999999999:AAnewDummyTokenViaStdin0000000000"
+printf '%s\n' "$NEW_TOKEN" | bash "$SCRIPT" --set-secret TELEGRAM_BOT_TOKEN >/dev/null 2>&1
+check "--set-secret updated value" bash -c 'grep -qF "$1" <<< "$2"' _ "TELEGRAM_BOT_TOKEN='$NEW_TOKEN'" "$(dec)"
+check "--set-secret kept a single definition" test "$(dec | grep -c '^TELEGRAM_BOT_TOKEN=')" -eq 1
+printf 'x\n' | bash "$SCRIPT" --set-secret 'BAD-NAME' >/dev/null 2>&1
+check "--set-secret rejects invalid names" test $? -ne 0
+ALL_SECRETS+=("$NEW_TOKEN")
+
+# --edit-secrets: plaintext only in a 0600 file inside the RAM dir.
+cat > "$WORK/editor.sh" <<EOF
+#!/usr/bin/env bash
+{ echo "path=\$1"; stat -c 'mode=%a' "\$1"; } > "$WORK/editor.seen"
+grep -q 'ABUSEIPDB_API_KEYS' "\$1" && echo seen-plaintext >> "$WORK/editor.seen"
+printf "HOST_LABEL='edited-host'\n" >> "\$1"
+EOF
+chmod +x "$WORK/editor.sh"
+EDITOR="$WORK/editor.sh" run_checker --edit-secrets
+check "--edit-secrets rc 0" test "$RC" -eq 0
+check "editor got a file inside the RAM dir" grep -q "path=$ABUSE_CHECKER_RAMDIR/" "$WORK/editor.seen"
+check "RAM file was mode 0600" grep -q "mode=600" "$WORK/editor.seen"
+check "editor saw decrypted content" grep -q seen-plaintext "$WORK/editor.seen"
+check "RAM file shredded afterwards" test -z "$(ls -A "$ABUSE_CHECKER_RAMDIR")"
+check "edit re-encrypted" bash -c 'grep -q "HOST_LABEL=.edited-host." <<< "$1"' _ "$(dec)"
+check "still no plaintext file left" no_plain_leaks
+cp "$C/secrets.conf.enc" "$WORK/enc.before"
+printf '#!/usr/bin/env bash\necho "X=\$(id)" >> "$1"\n' > "$WORK/bad_editor.sh"; chmod +x "$WORK/bad_editor.sh"
+EDITOR="$WORK/bad_editor.sh" run_checker --edit-secrets </dev/null
+check "invalid edit (command substitution) rejected" test "$RC" -ne 0
+check "store unchanged after rejected edit" cmp -s "$C/secrets.conf.enc" "$WORK/enc.before"
+check "RAM dir empty after rejected edit" test -z "$(ls -A "$ABUSE_CHECKER_RAMDIR")"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WORK/noop_editor.sh"; chmod +x "$WORK/noop_editor.sh"
+EDITOR="$WORK/noop_editor.sh" run_checker --edit-secrets
+check "unchanged edit: no re-encryption" grep -q "no changes" <<< "$OUT"
+
+leak=0
+for s in "${ALL_SECRETS[@]}"; do grep -qF -- "$s" "$WORK/openssl_argv.log" && leak=1; done
+check "openssl never receives secrets in argv" test "$leak" -eq 0
+check "openssl key passed as -pass file:" grep -q -- "-pass file:" "$WORK/openssl_argv.log"
+
+# Tampered master key must fail loudly, not run with empty config.
+cp "$C/.master.key" "$WORK/master.bak"; chmod 600 "$C/.master.key"
+"$REAL_OPENSSL" rand -hex 32 > "$C/.master.key"
+run_checker --run
+check "wrong master key: aborts with error" bash -c '[[ $1 -ne 0 ]] && grep -q "cannot decrypt" <<< "$2"' _ "$RC" "$OUT"
+cp "$WORK/master.bak" "$C/.master.key"
+export PATH="$OLDPATH"
+
+if command -v systemd-creds >/dev/null 2>&1 && printf x | systemd-creds encrypt --name=t - - >/dev/null 2>&1; then
+    section "Encrypted secrets (systemd-creds tier)"
+    setup_env
+    ABUSE_CHECKER_CRYPTO=systemd run_checker --encrypt-secrets
+    check "systemd tier: secrets.cred created" test -s "$C/secrets.cred"
+    check "systemd tier: plain file removed" test ! -e "$C/secrets.conf"
+    check "systemd tier: drop-in uses LoadCredentialEncrypted" grep -q "^LoadCredentialEncrypted=secrets:$C/secrets.cred" "$ABUSE_CHECKER_DROPIN_DIR/10-secrets.conf"
+    run_checker --status
+    check "systemd tier: secrets load" grep -q "API keys    : 2 configured" <<< "$OUT"
+    check "systemd tier: no plaintext left" no_plain_leaks
+else
+    printf '  SKIP systemd-creds tier (systemd-creds unavailable here)\n'
+fi
+
+# ---------------------------------------------------------------------------
+section "Built-in uninstaller (--uninstall) in a fake root"
+mk_root() {
+    rm -rf "$WORK/root"; local r="$WORK/root"
+    mkdir -p "$r/usr/local/bin" "$r/usr/local/lib/abuse-checker/connectors.d" "$r/etc/abuse-checker" \
+             "$r/var/lib/abuse-checker/reports" "$r/etc/systemd/system/abuse-checker.service.d"
+    touch "$r/usr/local/bin/abuse-checker" "$r/etc/systemd/system/abuse-checker.service" \
+          "$r/etc/systemd/system/abuse-checker.timer" "$r/etc/abuse-checker/secrets.conf.enc" \
+          "$r/var/lib/abuse-checker/reports/report_x.html"
+}
+mk_root
+OUT="$(printf '3\n' | AC_ROOT="$WORK/root" ABUSE_CHECKER_ASSUME_TTY=1 bash "$SCRIPT" --uninstall 2>&1)"
+check "menu shows option [1]" grep -q "\[1\] Remove application & systemd timer only (KEEP encrypted secrets, ips.txt, and HTML reports)" <<< "$OUT"
+check "menu shows option [2]" grep -q "\[2\] Full Purge (Remove everything including" <<< "$OUT"
+check "menu shows option [3]" grep -q "\[3\] Cancel" <<< "$OUT"
+check "menu lists exact paths" grep -q "$WORK/root/usr/local/bin/abuse-checker" <<< "$OUT"
+check "cancel removes nothing" test -e "$WORK/root/usr/local/bin/abuse-checker"
+OUT="$(printf '1\n' | AC_ROOT="$WORK/root" ABUSE_CHECKER_ASSUME_TTY=1 bash "$SCRIPT" --uninstall 2>&1)"
+check "[1] removes binary" test ! -e "$WORK/root/usr/local/bin/abuse-checker"
+check "[1] removes connectors lib" test ! -e "$WORK/root/usr/local/lib/abuse-checker"
+check "[1] removes units + drop-ins" test ! -e "$WORK/root/etc/systemd/system/abuse-checker.timer" -a ! -e "$WORK/root/etc/systemd/system/abuse-checker.service.d"
+check "[1] keeps encrypted secrets" test -e "$WORK/root/etc/abuse-checker/secrets.conf.enc"
+check "[1] keeps reports" test -e "$WORK/root/var/lib/abuse-checker/reports/report_x.html"
+mk_root
+OUT="$(printf '2\nnope\n' | AC_ROOT="$WORK/root" ABUSE_CHECKER_ASSUME_TTY=1 bash "$SCRIPT" --uninstall 2>&1)"
+check "[2] without typed confirmation cancels" test -e "$WORK/root/etc/abuse-checker"
+OUT="$(printf '2\npurge\n' | AC_ROOT="$WORK/root" ABUSE_CHECKER_ASSUME_TTY=1 bash "$SCRIPT" --uninstall 2>&1)"
+check "[2] purges /etc/abuse-checker" test ! -e "$WORK/root/etc/abuse-checker"
+check "[2] purges /var/lib/abuse-checker" test ! -e "$WORK/root/var/lib/abuse-checker"
+check "[2] removes binary" test ! -e "$WORK/root/usr/local/bin/abuse-checker"
+mk_root
+OUT="$(AC_ROOT="$WORK/root" bash "$SCRIPT" --uninstall </dev/null 2>&1)"; RC=$?
+check "non-interactive without flag refuses" test "$RC" -ne 0 -a -e "$WORK/root/usr/local/bin/abuse-checker"
+OUT="$(AC_ROOT="$WORK/root" bash "$ROOT/uninstall.sh" --keep </dev/null 2>&1)"
+check "uninstall.sh --keep wrapper works" test ! -e "$WORK/root/usr/local/bin/abuse-checker" -a -e "$WORK/root/etc/abuse-checker/secrets.conf.enc"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

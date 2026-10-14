@@ -8,7 +8,9 @@ After=network-online.target
 Type=oneshot
 User=abusechecker
 Group=abusechecker
-EnvironmentFile=/etc/abuse-checker/secrets.conf
+# Secrets are provided by the generated drop-in
+# abuse-checker.service.d/10-secrets.conf (LoadCredentialEncrypted= for
+# systemd-creds, or LoadCredential= of the OpenSSL master key).
 ExecStart=/usr/local/bin/abuse-checker --run
 TimeoutStartSec=30min
 Nice=10

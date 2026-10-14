@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.0.0"
+readonly AC_VERSION="1.1.0"
 
 # ---------------------------------------------------------------------------
 # Paths (overridable through the environment, mainly for tests)
@@ -16,6 +16,8 @@ CURL_BIN="${ABUSE_CHECKER_CURL:-curl}"
 SERVICE_USER="abusechecker"
 
 TMPD=""
+RAM_FILES=()
+RAM_COPY=""
 MODE="run"
 DRY_RUN=false
 FORCE_FULL=false
@@ -33,8 +35,13 @@ die()  { log ERROR "$*"; exit 1; }
 # Newline-separated list of every configured secret (keys, tokens, webhooks).
 secret_list() {
     local v item
-    for v in "${ABUSEIPDB_API_KEYS:-}" "${TELEGRAM_BOT_TOKEN:-}" "${SLACK_WEBHOOK_URLS:-}" \
-             "${SMTP_PASS:-}"; do
+    local -a vals=("${ABUSEIPDB_API_KEYS:-}" "${TELEGRAM_BOT_TOKEN:-}" "${SLACK_WEBHOOK_URLS:-}" "${SMTP_PASS:-}")
+    # Custom connectors: any variable whose name looks secret is scrubbed too.
+    for v in $(compgen -v | grep -E '(TOKEN|_KEY|_KEYS|PASS|PASSWORD|SECRET|WEBHOOK)' || true); do
+        [[ "$v" == "MASTER_KEY" ]] && continue
+        vals+=("${!v:-}")
+    done
+    for v in "${vals[@]}"; do
         IFS=',' read -r -a _parts <<< "$v"
         for item in "${_parts[@]}"; do
             item="$(trim "$item")"
@@ -105,15 +112,7 @@ secure_curl() {
 # Configuration
 # ---------------------------------------------------------------------------
 load_config() {
-    if [[ -r "$SECRETS_FILE" ]]; then
-        if [[ -n "$(find "$SECRETS_FILE" -perm -0002 2>/dev/null)" ]]; then
-            die "$SECRETS_FILE is world-writable; refusing to load it"
-        fi
-        set -a
-        # shellcheck source=/dev/null
-        . "$SECRETS_FILE"
-        set +a
-    fi
+    load_secrets
     IPS_FILE="${IPS_FILE:-$CONF_DIR/ips.txt}"
     STATE_FILE="${STATE_FILE:-$STATE_DIR/state.json}"
     REPORT_DIR="${REPORT_DIR:-$STATE_DIR/reports}"
@@ -299,8 +298,12 @@ check_target() {
 collect_results() {
     local results="$1" target ip rc
     local -a targets
+    : > "$results"
     mapfile -t targets < <(read_targets "$IPS_FILE")
-    (( ${#targets[@]} > 0 )) || die "no valid targets in $IPS_FILE"
+    if (( ${#targets[@]} == 0 )); then
+        warn "no valid targets in $IPS_FILE (only comments/blank lines?); nothing to check"
+        return 0
+    fi
     if ! $DRY_RUN && (( ${#API_KEYS[@]} == 0 )); then
         die "ABUSEIPDB_API_KEYS is not configured"
     fi
@@ -491,104 +494,399 @@ plain_summary() {
         "\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted."' "$data"
 }
 
-send_telegram() {
-    local data="$1" report="$2" title="$3" text chat cfg ok=0 fail=0
-    [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_IDS:-}" ]] || return 0
-    text="$(jq -r --arg title "$title" --argjson force "$FORCE_FULL" '
-        def e: tostring | gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
-        def icon: {"NEW":"🔴","ESCALATED":"🟠","UNCHANGED":"🟡"}[.status] // "";
-        [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
-        | "<b>\($title|e)</b>\n"
-        + "Checked <b>\(length)</b> · New <b>\(map(select(.status=="NEW"))|length)</b> · Escalated <b>\(map(select(.status=="ESCALATED"))|length)</b>\n\n"
-        + ([$a[:25][] | "\(icon) <code>\(.target|e)</code> — \(.score)% · \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n    <i>\(.isp|e)</i>" else "" end)] | join("\n"))
-        + (if ($a|length) > 25 then "\n…and \(($a|length) - 25) more (see report)" else "" end)
-        + "\n\n<i>\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted.</i>"' "$data")"
-    while IFS= read -r chat; do
-        cfg="$(cfg_line url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")
-$(cfg_line form-string "chat_id=$chat")
-$(cfg_line form-string "parse_mode=HTML")
-$(cfg_line form-string "disable_web_page_preview=true")
-$(cfg_line form-string "text=$text")"
-        if secure_curl "$cfg" --max-time 30 --fail -o /dev/null; then ok=$((ok+1)); else fail=$((fail+1)); warn "Telegram sendMessage to chat $chat failed"; fi
-        if [[ -f "$report" ]]; then
-            cfg="$(cfg_line url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument")
-$(cfg_line form-string "chat_id=$chat")
-$(cfg_line form "document=@$report;type=text/html")
-$(cfg_line form-string "caption=Interactive report: $(basename "$report")")"
-            secure_curl "$cfg" --max-time 60 --fail -o /dev/null || { fail=$((fail+1)); warn "Telegram sendDocument to chat $chat failed"; }
-        fi
-    done < <(split_csv "$TELEGRAM_CHAT_IDS")
-    info "Telegram: $ok chat(s) notified, $fail failure(s)"
-}
-
-send_slack() {
-    local data="$1" report="$2" title="$3" payload url n=0 i=0
-    [[ -n "${SLACK_WEBHOOK_URLS:-}" ]] || return 0
-    payload="$TMPD/slack.json"
-    jq --arg title "$title" --arg report "$(basename "$report")" --argjson force "$FORCE_FULL" '
-        [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
-        | {text:$title, blocks:(
-            [{type:"header", text:{type:"plain_text", text:$title[:150]}},
-             {type:"section", fields:[
-                {type:"mrkdwn", text:"*Checked:* \(length)"},
-                {type:"mrkdwn", text:"*Clean:* \(map(select(.status=="CLEAN"))|length)"},
-                {type:"mrkdwn", text:":red_circle: *New:* \(map(select(.status=="NEW"))|length)"},
-                {type:"mrkdwn", text:":large_orange_circle: *Escalated:* \(map(select(.status=="ESCALATED"))|length)"}]},
-             {type:"divider"}]
-            + [$a[:20][] | {type:"section",
-                text:{type:"mrkdwn", text:("*\(.status)* `\(.target)` — score *\(.score)%*, \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n_\(.isp)_ \(.country // "")" else "" end))},
-                accessory:{type:"button", text:{type:"plain_text", text:"AbuseIPDB"}, url:"https://www.abuseipdb.com/check/\(.target|@uri)"}}]
-            + [{type:"context", elements:[{type:"mrkdwn", text:"\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted · full report: \($report)"}]}])}' "$data" > "$payload" \
-        || { warn "Slack: failed to build payload"; return 1; }
-    while IFS= read -r url; do
-        i=$((i+1))
-        if secure_curl "$(cfg_line url "$url")
-$(cfg_line header "Content-Type: application/json")" --max-time 30 --fail -o /dev/null --data-binary "@$payload"; then
-            n=$((n+1))
-        else
-            warn "Slack webhook #$i failed"
-        fi
-    done < <(split_csv "$SLACK_WEBHOOK_URLS")
-    info "Slack: $n of $i webhook(s) notified"
-}
-
-send_email() {
-    local data="$1" report="$2" title="$3" msg boundary rcpt cfg to_hdr
-    [[ -n "${EMAIL_TO:-}" ]] || return 0
-    msg="$TMPD/mail.eml"; boundary="=_ac_$(date +%s)_$$"
-    to_hdr="$(split_csv "$EMAIL_TO" | paste -sd, - | sed 's/,/, /g')"
-    {
-        printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\n' \
-            "$EMAIL_FROM" "$to_hdr" "$title" "$(date -R)"
-        printf 'Content-Type: multipart/mixed; boundary="%s"\r\n\r\n' "$boundary"
-        printf -- '--%s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n' "$boundary"
-        plain_summary "$data" "$title" | sed 's/$/\r/'
-        if [[ -f "$report" ]]; then
-            printf '\r\n--%s\r\nContent-Type: text/html; charset=utf-8; name="%s"\r\n' "$boundary" "$(basename "$report")"
-            printf 'Content-Disposition: attachment; filename="%s"\r\nContent-Transfer-Encoding: base64\r\n\r\n' "$(basename "$report")"
-            base64 -w 76 "$report" | sed 's/$/\r/'
-        fi
-        printf '\r\n--%s--\r\n' "$boundary"
-    } > "$msg"
-    if [[ -n "${SMTP_URL:-}" ]]; then
-        cfg="$(cfg_line url "$SMTP_URL")
-$(cfg_line mail-from "${SMTP_FROM:-${EMAIL_FROM}}")
-$(cfg_line upload-file "$msg")"
-        [[ -n "${SMTP_USER:-}" ]] && cfg+=$'\n'"$(cfg_line user "${SMTP_USER}:${SMTP_PASS:-}")"
-        [[ "$SMTP_URL" == smtp://* ]] && cfg+=$'\n'"ssl-reqd"
-        while IFS= read -r rcpt; do cfg+=$'\n'"$(cfg_line mail-rcpt "$rcpt")"; done < <(split_csv "$EMAIL_TO")
-        if secure_curl "$cfg" --max-time 60; then info "Email: sent to $to_hdr via SMTP"; else warn "Email via SMTP failed"; fi
-    elif command -v sendmail >/dev/null 2>&1; then
-        if sendmail -t < "$msg"; then info "Email: sent to $to_hdr via sendmail"; else warn "Email via sendmail failed"; fi
+# ---------------------------------------------------------------------------
+# Connectors (connectors.d/*.sh)
+# ---------------------------------------------------------------------------
+connectors_dir() {
+    if [[ -n "${ABUSE_CHECKER_CONNECTORS_DIR:-}" ]]; then
+        printf '%s' "$ABUSE_CHECKER_CONNECTORS_DIR"
+    elif [[ -d "$LIB_DIR/connectors.d" ]]; then
+        printf '%s' "$LIB_DIR/connectors.d"
     else
-        warn "EMAIL_TO is set but neither SMTP_URL nor sendmail is available"
+        # Running from a source checkout.
+        printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/connectors"
     fi
 }
 
+# Print the connector files that pass every guard; warn about the rest.
+valid_connectors() {
+    local dir f
+    dir="$(connectors_dir)"
+    [[ -d "$dir" ]] || { warn "connector directory $dir not found; no notifications"; return 0; }
+    for f in "$dir"/*.sh; do
+        [[ -e "$f" ]] || continue
+        if [[ ! -f "$f" || ! -r "$f" ]]; then
+            warn "connector $(basename "$f"): not a readable file; skipped"
+        elif [[ ! -s "$f" ]]; then
+            warn "connector $(basename "$f"): empty file; skipped"
+        elif ! grep -vqE '^[[:space:]]*(#|$)' "$f"; then
+            warn "connector $(basename "$f"): only comments/whitespace; skipped"
+        elif ! bash -n "$f" 2>/dev/null; then
+            warn "connector $(basename "$f"): syntax error (bash -n failed); skipped"
+        elif ! ( # shellcheck source=/dev/null
+                 . "$f" >/dev/null 2>&1 && declare -F connector_enabled >/dev/null \
+                 && declare -F connector_send >/dev/null ); then
+            warn "connector $(basename "$f"): missing connector_enabled/connector_send; skipped"
+        else
+            printf '%s\n' "$f"
+        fi
+    done
+    return 0
+}
+
+# notify_all <classified.json> <report.html> <title>
 notify_all() {
-    send_telegram "$@" || warn "Telegram delivery error"
-    send_slack "$@" || warn "Slack delivery error"
-    send_email "$@" || warn "Email delivery error"
+    local f name rc sent=0
+    while IFS= read -r f; do
+        name="$(basename "$f" .sh)"
+        rc=0
+        (
+            unset -f connector_enabled connector_send
+            CONNECTOR_NAME=""
+            # shellcheck source=/dev/null
+            . "$f"
+            connector_enabled || exit 3
+            info "connector ${CONNECTOR_NAME:-$name}: delivering"
+            connector_send "$@"
+        ) || rc=$?
+        case "$rc" in
+            0) sent=$((sent + 1)) ;;
+            3) ;;  # not configured
+            *) warn "connector $name failed (exit $rc)" ;;
+        esac
+    done < <(valid_connectors)
+    (( sent > 0 )) || warn "no connector delivered the alert (none configured?)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Encrypted secrets store
+#   Tier 1: systemd-creds   -> secrets.cred  (LoadCredentialEncrypted=)
+#   Tier 2: OpenSSL AES-256 -> secrets.conf.enc + .master.key (LoadCredential=)
+#   Legacy: plain secrets.conf (still loaded, with a warning)
+# Plaintext only ever exists in pipes or in a 0600 file on RAM (/dev/shm).
+# Keys are passed to openssl as `-pass file:` so nothing secret is in argv.
+# ---------------------------------------------------------------------------
+ENC_FILE="$CONF_DIR/secrets.conf.enc"
+CRED_FILE="$CONF_DIR/secrets.cred"
+MASTER_KEY="$CONF_DIR/.master.key"
+LIB_DIR="${ABUSE_CHECKER_LIB_DIR:-/usr/local/lib/abuse-checker}"
+DROPIN_DIR="${ABUSE_CHECKER_DROPIN_DIR:-/etc/systemd/system/abuse-checker.service.d}"
+RAM_DIR="${ABUSE_CHECKER_RAMDIR:-/dev/shm}"
+OPENSSL_OPTS=(enc -aes-256-cbc -pbkdf2 -iter 100000 -md sha256)
+
+systemd_version() { systemctl --version 2>/dev/null | awk 'NR==1 {print $2+0}'; }
+
+# Which tier to use for new encryptions.
+crypto_tier() {
+    case "${ABUSE_CHECKER_CRYPTO:-auto}" in
+        openssl|systemd) printf '%s' "$ABUSE_CHECKER_CRYPTO"; return 0 ;;
+    esac
+    if command -v systemd-creds >/dev/null 2>&1 && [[ -d /run/systemd/system ]] \
+       && (( $(systemd_version || echo 0) >= 250 )) \
+       && printf 'probe' | systemd-creds encrypt --name=probe - - >/dev/null 2>&1; then
+        printf systemd
+    else
+        printf openssl
+    fi
+}
+
+# Which store currently holds the secrets: systemd|openssl|plain|none
+current_store() {
+    if [[ -f "$CRED_FILE" ]]; then printf systemd
+    elif [[ -f "$ENC_FILE" ]]; then printf openssl
+    elif [[ -f "$SECRETS_FILE" ]]; then printf plain
+    else printf none; fi
+}
+
+master_key_path() {
+    if [[ -n "${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/master.key" ]]; then
+        printf '%s' "$CREDENTIALS_DIRECTORY/master.key"
+    else
+        printf '%s' "$MASTER_KEY"
+    fi
+}
+
+# Decrypt the current store to stdout (pipe only).
+secrets_cat() {
+    case "$(current_store)" in
+        systemd) systemd-creds decrypt --name=secrets "$CRED_FILE" - ;;
+        openssl) openssl "${OPENSSL_OPTS[@]}" -d -pass "file:$(master_key_path)" -in "$ENC_FILE" ;;
+        plain)   cat "$SECRETS_FILE" ;;
+        none)    return 1 ;;
+    esac
+}
+
+# Accept only blank lines, comments and KEY=value assignments without
+# command substitution, then make sure bash can parse it.
+validate_secrets() {
+    local f="$1" bad
+    bad="$(grep -nvE "^[[:space:]]*(#.*)?$|^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=(\"[^\"\`]*\"|'[^']*'|[^[:space:]\"'\`\$;&|<>()]*)[[:space:]]*(#.*)?$" "$f" || true)"
+    if [[ -n "$bad" ]]; then
+        # shellcheck disable=SC2016
+        printf 'invalid line(s) (use KEY="value" or KEY='"'"'value'"'"'; no $(...), backticks or ;):\n%s\n' \
+            "$(cut -d: -f1 <<< "$bad" | sed 's/^/  line /')" >&2
+        return 1
+    fi
+    bash -n "$f" 2>/dev/null || { echo "bash syntax check failed" >&2; return 1; }
+}
+
+secure_rm() {
+    local f
+    for f in "$@"; do
+        [[ -e "$f" ]] || continue
+        if command -v shred >/dev/null 2>&1; then shred -u -z "$f" 2>/dev/null || rm -f "$f"; else rm -f "$f"; fi
+    done
+}
+
+# 0600 file on RAM for editing; never on persistent disk.
+ram_tmpfile() {
+    [[ -d "$RAM_DIR" && -w "$RAM_DIR" ]] || die "RAM directory $RAM_DIR not available; refusing to write secrets to disk"
+    (umask 077; mktemp "$RAM_DIR/abuse-checker-secrets.XXXXXX")
+}
+
+ensure_master_key() {
+    [[ -s "$MASTER_KEY" ]] && return 0
+    (umask 277; openssl rand -hex 32 > "$MASTER_KEY")
+    chmod 0400 "$MASTER_KEY"
+    [[ $EUID -eq 0 ]] && chown root:root "$MASTER_KEY"
+    info "generated new 256-bit master key $MASTER_KEY"
+}
+
+# store_secrets <plaintext-file-on-ram>: encrypt into the preferred tier,
+# remove other/legacy stores, refresh the systemd drop-in.
+store_secrets() {
+    local plain="$1" tier tmp
+    validate_secrets "$plain" || return 1
+    tier="$(crypto_tier)"
+    if [[ "$tier" == "systemd" ]]; then
+        tmp="$(mktemp "$CONF_DIR/.secrets.cred.XXXXXX")"
+        systemd-creds encrypt --name=secrets "$plain" "$tmp" 2>/dev/null || { rm -f "$tmp"; die "systemd-creds encrypt failed"; }
+        chmod 0600 "$tmp"; mv -f "$tmp" "$CRED_FILE"
+        rm -f "$ENC_FILE"
+    else
+        command -v openssl >/dev/null 2>&1 || die "openssl is required for encrypted secrets"
+        ensure_master_key
+        tmp="$(mktemp "$CONF_DIR/.secrets.enc.XXXXXX")"
+        openssl "${OPENSSL_OPTS[@]}" -salt -pass "file:$MASTER_KEY" -in "$plain" -out "$tmp" \
+            || { rm -f "$tmp"; die "openssl encryption failed"; }
+        chmod 0640 "$tmp"
+        if [[ $EUID -eq 0 ]] && getent group "$SERVICE_USER" >/dev/null 2>&1; then chown "root:$SERVICE_USER" "$tmp"; fi
+        mv -f "$tmp" "$ENC_FILE"
+        rm -f "$CRED_FILE"
+    fi
+    # Round-trip check before any plaintext is destroyed.
+    cmp -s "$plain" <(secrets_cat 2>/dev/null) || die "verification of the encrypted store failed"
+    if [[ -f "$SECRETS_FILE" ]]; then
+        secure_rm "$SECRETS_FILE"
+        info "removed plain-text $SECRETS_FILE"
+    fi
+    info "secrets encrypted ($tier tier)"
+    write_dropin
+}
+
+# systemd drop-in matching the active store. Only touches the real unit
+# directory when using the default /etc/abuse-checker layout.
+write_dropin() {
+    local store cfg
+    if [[ -z "${ABUSE_CHECKER_DROPIN_DIR:-}" && "$CONF_DIR" != "/etc/abuse-checker" ]]; then return 0; fi
+    store="$(current_store)"
+    case "$store" in
+        systemd) cfg="LoadCredentialEncrypted=secrets:$CRED_FILE" ;;
+        openssl) cfg="LoadCredential=master.key:$MASTER_KEY" ;;
+        plain)   cfg="EnvironmentFile=$SECRETS_FILE" ;;
+        none)    cfg="" ;;
+    esac
+    mkdir -p "$DROPIN_DIR"
+    printf '# Generated by abuse-checker; secrets store: %s\n[Service]\n%s\n' "$store" "$cfg" \
+        > "$DROPIN_DIR/10-secrets.conf"
+    chmod 0644 "$DROPIN_DIR/10-secrets.conf"
+    if [[ -z "${ABUSE_CHECKER_DROPIN_DIR:-}" && -d /run/systemd/system ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+# Load secrets into the environment (called before redaction is installed).
+load_secrets() {
+    set -a
+    if [[ -n "${CREDENTIALS_DIRECTORY:-}" && -r "$CREDENTIALS_DIRECTORY/secrets" ]]; then
+        # shellcheck source=/dev/null
+        . "$CREDENTIALS_DIRECTORY/secrets"
+    elif [[ -f "$ENC_FILE" ]]; then
+        if [[ -r "$ENC_FILE" && -r "$(master_key_path)" ]]; then
+            local dec
+            dec="$(openssl "${OPENSSL_OPTS[@]}" -d -pass "file:$(master_key_path)" -in "$ENC_FILE" 2>/dev/null)" \
+                || { set +a; die "cannot decrypt $ENC_FILE (wrong or missing master key?)"; }
+            # shellcheck source=/dev/null
+            . <(printf '%s\n' "$dec")
+            unset dec
+        elif [[ -z "${ABUSEIPDB_API_KEYS:-}" ]]; then
+            warn "secrets are encrypted but the master key is not readable; run as root or via systemd"
+        fi
+    elif [[ -f "$CRED_FILE" ]]; then
+        if [[ $EUID -eq 0 ]] && command -v systemd-creds >/dev/null 2>&1; then
+            # shellcheck source=/dev/null
+            . <(systemd-creds decrypt --name=secrets "$CRED_FILE" - 2>/dev/null) \
+                || warn "cannot decrypt $CRED_FILE"
+        elif [[ -z "${ABUSEIPDB_API_KEYS:-}" ]]; then
+            warn "secrets are in $CRED_FILE; run as root or via systemd"
+        fi
+    elif [[ -r "$SECRETS_FILE" ]]; then
+        if [[ -n "$(find "$SECRETS_FILE" -perm -0002 2>/dev/null)" ]]; then
+            set +a; die "$SECRETS_FILE is world-writable; refusing to load it"
+        fi
+        # shellcheck source=/dev/null
+        . "$SECRETS_FILE"
+        warn "secrets are stored in plain text ($SECRETS_FILE); run 'sudo abuse-checker --encrypt-secrets'"
+    fi
+    set +a
+}
+
+require_admin() {
+    if [[ $EUID -ne 0 && "$CONF_DIR" == "/etc/abuse-checker" ]]; then
+        die "this command must be run as root (sudo abuse-checker $1)"
+    fi
+    [[ -d "$CONF_DIR" ]] || die "$CONF_DIR does not exist (run install.sh)"
+}
+
+# Plaintext of the current store (or the template) into a RAM file whose
+# path is left in RAM_COPY (no subshell, so cleanup sees it in RAM_FILES).
+open_ram_copy() {
+    RAM_COPY="$(ram_tmpfile)"
+    RAM_FILES+=("$RAM_COPY")
+    if ! secrets_cat > "$RAM_COPY" 2>/dev/null; then
+        if [[ "$(current_store)" != "none" ]]; then die "cannot decrypt the current secrets store"; fi
+        if [[ -r "$CONF_DIR/secrets.conf.example" ]]; then cat "$CONF_DIR/secrets.conf.example" > "$RAM_COPY"
+        else printf '# abuse-checker secrets\nABUSEIPDB_API_KEYS=""\n' > "$RAM_COPY"; fi
+    fi
+}
+
+cleanup_ram() { secure_rm "${RAM_FILES[@]}"; }
+
+cmd_edit_secrets() {
+    require_admin --edit-secrets
+    local ram editor before after reply
+    trap cleanup_ram EXIT
+    open_ram_copy; ram="$RAM_COPY"
+    before="$(cksum < "$ram")"
+    editor="${VISUAL:-${EDITOR:-}}"
+    if [[ -z "$editor" ]]; then
+        if command -v nano >/dev/null 2>&1; then editor="nano"; else editor="vi"; fi
+    fi
+    while true; do
+        # Word splitting allows EDITOR="code --wait" style values.
+        # shellcheck disable=SC2086
+        $editor "$ram" || die "editor exited with an error; nothing changed"
+        if validate_secrets "$ram"; then break; fi
+        if [[ -t 0 ]]; then
+            read -r -p "Re-open the editor to fix it? [Y/n] " reply
+            [[ "$reply" =~ ^[Nn] ]] && die "aborted; nothing changed"
+        else
+            die "invalid configuration; nothing changed"
+        fi
+    done
+    after="$(cksum < "$ram")"
+    if [[ "$before" == "$after" && "$(current_store)" != "plain" && "$(current_store)" != "none" ]]; then
+        info "no changes"
+        return 0
+    fi
+    store_secrets "$ram"
+}
+
+# --encrypt-secrets [--from FILE]: migrate plain text into the encrypted store.
+cmd_encrypt_secrets() {
+    require_admin --encrypt-secrets
+    local src="${1:-$SECRETS_FILE}" ram
+    trap cleanup_ram EXIT
+    [[ -f "$src" ]] || {
+        [[ "$(current_store)" =~ ^(openssl|systemd)$ ]] && { info "secrets are already encrypted ($(current_store))"; return 0; }
+        die "no plain-text secrets file found at $src"
+    }
+    ram="$(ram_tmpfile)"; RAM_FILES+=("$ram")
+    cat "$src" > "$ram"
+    store_secrets "$ram"
+    [[ "$src" != "$SECRETS_FILE" && -f "$src" ]] && secure_rm "$src"
+    return 0
+}
+
+# --set-secret KEY  (value read from stdin, so it never appears in argv)
+cmd_set_secret() {
+    local key="$1" value ram tmp
+    require_admin --set-secret
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid variable name: $key"
+    IFS= read -r value || true
+    [[ "$value" != *"'"* ]] || die "values may not contain single quotes"
+    trap cleanup_ram EXIT
+    open_ram_copy; ram="$RAM_COPY"
+    tmp="$(ram_tmpfile)"; RAM_FILES+=("$tmp")
+    AC_VAL="$value" awk -v k="$key" '
+        BEGIN { line = k "='"'"'" ENVIRON["AC_VAL"] "'"'"'" }
+        $0 ~ "^[[:space:]]*(export[[:space:]]+)?" k "=" { if (!done) print line; done = 1; next }
+        { print }
+        END { if (!done) print line }' "$ram" > "$tmp"
+    cat "$tmp" > "$ram"
+    store_secrets "$ram"
+    info "updated $key"
+}
+
+# ---------------------------------------------------------------------------
+# Built-in uninstaller
+# ---------------------------------------------------------------------------
+cmd_uninstall() {
+    local choice="${1:-}" r="${AC_ROOT:-}" p size reply
+    local conf="$r/etc/abuse-checker" state="$r/var/lib/abuse-checker"
+    local -a app=("$r/usr/local/bin/abuse-checker" "$r/usr/local/lib/abuse-checker"
+                  "$r/usr/local/share/doc/abuse-checker"
+                  "$r/etc/systemd/system/abuse-checker.service"
+                  "$r/etc/systemd/system/abuse-checker.timer"
+                  "$r/etc/systemd/system/abuse-checker.service.d"
+                  "$r/etc/systemd/system/abuse-checker.timer.d")
+    [[ $EUID -eq 0 || -n "$r" ]] || die "run as root: sudo abuse-checker --uninstall"
+    show() { for p in "$@"; do [[ -e "$p" ]] || continue; size="$(du -sh "$p" 2>/dev/null | cut -f1)"; printf '      %-55s %s\n' "$p" "$size"; done; }
+    if [[ -z "$choice" ]]; then
+        if [[ -t 0 || "${ABUSE_CHECKER_ASSUME_TTY:-}" == "1" ]]; then
+            echo "abuse-checker uninstaller"
+            echo
+            echo "  [1] Remove application & systemd timer only (KEEP encrypted secrets, ips.txt, and HTML reports)"
+            echo "      Removes:"
+            show "${app[@]}"
+            echo "  [2] Full Purge (Remove everything including /etc/abuse-checker, /var/lib/abuse-checker, and the '$SERVICE_USER' user)"
+            echo "      Additionally removes:"
+            show "$conf" "$state"
+            echo "  [3] Cancel"
+            echo
+            read -r -p "Choose [1-3] (default 3): " reply || reply=3
+            case "$reply" in 1) choice=keep ;; 2) choice=purge ;; *) echo "Cancelled."; return 0 ;; esac
+            if [[ "$choice" == "purge" ]]; then
+                read -r -p "Type 'purge' to confirm deleting secrets, state and reports: " reply || reply=""
+                [[ "$reply" == "purge" ]] || { echo "Cancelled."; return 0; }
+            fi
+        else
+            die "non-interactive uninstall needs --keep or --purge"
+        fi
+    fi
+    if [[ -z "$r" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl disable --now abuse-checker.timer 2>/dev/null || true
+        systemctl stop abuse-checker.service 2>/dev/null || true
+    fi
+    for p in "${app[@]}"; do [[ -e "$p" ]] && { rm -rf "$p"; echo "removed $p"; }; done
+    if [[ -z "$r" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload
+        systemctl reset-failed abuse-checker.service abuse-checker.timer 2>/dev/null || true
+    fi
+    if [[ "$choice" == "purge" ]]; then
+        [[ -f "$conf/secrets.conf" ]] && secure_rm "$conf/secrets.conf"
+        [[ -f "$conf/.master.key" ]] && secure_rm "$conf/.master.key"
+        for p in "$conf" "$state"; do [[ -e "$p" ]] && { rm -rf "$p"; echo "removed $p"; }; done
+        if [[ -z "$r" ]] && id "$SERVICE_USER" >/dev/null 2>&1; then
+            userdel "$SERVICE_USER" 2>/dev/null || true
+            if getent group "$SERVICE_USER" >/dev/null; then groupdel "$SERVICE_USER" 2>/dev/null || true; fi
+            echo "removed system user $SERVICE_USER"
+        fi
+    else
+        echo "kept $conf and $state"
+    fi
+    echo "uninstall complete"
 }
 
 # ---------------------------------------------------------------------------
@@ -622,6 +920,10 @@ cmd_run() {
     ensure_state "$state_file"
     results="$TMPD/results.jsonl"; classified="$TMPD/classified.json"; newstate="$TMPD/state.new"
     collect_results "$results"
+    if [[ ! -s "$results" ]]; then
+        info "nothing checked; state left unchanged"
+        return 0
+    fi
     classify "$state_file" "$results" > "$classified"
     read_targets "$IPS_FILE" 2>/dev/null | jq -R . | jq -s . > "$TMPD/targets.json"
     jq -r '.[].target' "$classified" | jq -R . | jq -s --slurpfile t "$TMPD/targets.json" '. + $t[0] | unique' > "$TMPD/targets.all"
@@ -685,6 +987,10 @@ cmd_status() {
     fi
     echo "Reports     : $(find "$REPORT_DIR" -maxdepth 1 -name 'report_*.html' 2>/dev/null | wc -l) file(s) in $REPORT_DIR"
     echo "API keys    : ${#API_KEYS[@]} configured"
+    echo "Secrets     : $(current_store) store (new encryptions use: $(crypto_tier))"
+    local c names=""
+    while IFS= read -r c; do names+="$(basename "$c" .sh) "; done < <(valid_connectors 2>/dev/null)
+    echo "Connectors  : ${names:-none} ($(connectors_dir))"
     if command -v systemctl >/dev/null 2>&1; then
         echo "Next run    : $(systemctl show abuse-checker.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)"
         systemctl list-timers abuse-checker.timer --no-pager 2>/dev/null | sed -n '1,2p' || true
@@ -714,14 +1020,22 @@ Usage: abuse-checker [OPTION]
   --force-full-report   Alert on every currently dirty IP, ignoring the diff state
   --status              Show tracked IPs, dirty count, last run, next timer trigger
   --reset-state         Clear $STATE_DIR/state.json
+
+Secrets & maintenance (root):
+  --edit-secrets        Decrypt to RAM (/dev/shm), open \$EDITOR, validate, re-encrypt
+  --encrypt-secrets     Migrate plain-text secrets.conf into the encrypted store
+  --set-secret KEY      Set one variable; the value is read from stdin
+  --uninstall [--keep|--purge]
+                        Remove the application (menu when interactive)
   -h, --help            Show this help
   -V, --version         Show version
 EOF
 }
 
 main() {
-    local arg
-    for arg in "$@"; do
+    local arg extra=""
+    while (( $# )); do
+        arg="$1"; shift
         case "$arg" in
             --run) MODE="run" ;;
             --dry-run) MODE="run"; DRY_RUN=true ;;
@@ -729,11 +1043,27 @@ main() {
             --test-notify) MODE="test-notify" ;;
             --status) MODE="status" ;;
             --reset-state) MODE="reset" ;;
+            --edit-secrets) MODE="edit-secrets" ;;
+            --encrypt-secrets) MODE="encrypt-secrets" ;;
+            --from) extra="${1:?--from needs a path}"; shift ;;
+            --set-secret) MODE="set-secret"; extra="${1:?--set-secret needs a variable name}"; shift ;;
+            --uninstall) MODE="uninstall" ;;
+            --keep|--purge) extra="${arg#--}" ;;
+            --refresh-unit) MODE="refresh-unit" ;;
             -h|--help) usage; exit 0 ;;
             -V|--version) echo "$AC_VERSION"; exit 0 ;;
             *) usage >&2; exit 2 ;;
         esac
     done
+    # Management commands: interactive, no secrets loaded, no output filter
+    # (an editor needs the real terminal).
+    case "$MODE" in
+        edit-secrets) cmd_edit_secrets; return ;;
+        encrypt-secrets) cmd_encrypt_secrets "$extra"; return ;;
+        set-secret) cmd_set_secret "$extra"; return ;;
+        uninstall) cmd_uninstall "$extra"; return ;;
+        refresh-unit) write_dropin; return ;;
+    esac
     load_config
     install_redaction
     require_tools
