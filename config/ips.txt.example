@@ -1,0 +1,7 @@
+# /etc/abuse-checker/ips.txt  (root:abusechecker 0644)
+# One IP or CIDR per line. '#' starts a comment; blank lines are ignored.
+#
+# 203.0.113.10
+# 203.0.113.11        # mail relay
+# 198.51.100.0/28     # office range
+# 2001:db8::1

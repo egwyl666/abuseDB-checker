@@ -1,0 +1,37 @@
+[Unit]
+Description=AbuseIPDB abuse checker for monitored IPs/subnets
+Documentation=file:///usr/local/share/doc/abuse-checker/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=abusechecker
+Group=abusechecker
+EnvironmentFile=/etc/abuse-checker/secrets.conf
+ExecStart=/usr/local/bin/abuse-checker --run
+TimeoutStartSec=30min
+Nice=10
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0027
+ReadWritePaths=/var/lib/abuse-checker

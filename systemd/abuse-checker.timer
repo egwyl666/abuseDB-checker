@@ -1,0 +1,11 @@
+[Unit]
+Description=Run abuse-checker daily
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=abuse-checker.service
+
+[Install]
+WantedBy=timers.target
