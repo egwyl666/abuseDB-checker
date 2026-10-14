@@ -1,5 +1,7 @@
 # abuse-checker
 
+**English** · [Українська](README.uk.md)
+
 A small, dependency-light AbuseIPDB monitor for Linux servers. It is written in
 plain Bash and uses only `curl`, `jq`, `awk`, `sed`, `date`, `mktemp` and
 coreutils. Once a day a systemd timer checks a list of your IPs and subnets
