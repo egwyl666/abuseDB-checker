@@ -72,7 +72,7 @@ for t in bash curl jq awk sed date mktemp find install openssl; do
 done
 for f in abuse-checker.sh systemd/abuse-checker.service systemd/abuse-checker.timer \
          config/secrets.conf.example config/ips.txt.example \
-         connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh; do
+         connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh; do
     [[ -f "$SRC/$f" ]] || die "missing source file: $f"
 done
 bash -n "$SRC/abuse-checker.sh" || die "abuse-checker.sh has syntax errors; aborting"
@@ -175,14 +175,14 @@ wizard() {
     [[ "$reply" =~ ^[Yy] ]] || { echo "Skipped. Configure later with: sudo abuse-checker --edit-secrets"; return 0; }
     echo "Every step is optional: press Enter to skip it."
     echo
-    echo "  1/4 AbuseIPDB (https://www.abuseipdb.com/account/api)"
+    echo "  1/5 AbuseIPDB (https://www.abuseipdb.com/account/api)"
     ask v1 "API key(s), comma-separated" silent; put ABUSEIPDB_API_KEYS "$v1"
-    echo "  2/4 Telegram connector"
+    echo "  2/5 Telegram connector"
     ask v1 "Bot token (from @BotFather)" silent
     if [[ -n "$v1" ]]; then ask v2 "Chat IDs, comma-separated (groups start with -100)"; put TELEGRAM_BOT_TOKEN "$v1"; put TELEGRAM_CHAT_IDS "$v2"; fi
-    echo "  3/4 Slack connector"
+    echo "  3/5 Slack connector"
     ask v1 "Incoming webhook URL(s), comma-separated" silent; put SLACK_WEBHOOK_URLS "$v1"
-    echo "  4/4 Email connector"
+    echo "  4/5 Email connector"
     ask v1 "Recipients, comma-separated"
     if [[ -n "$v1" ]]; then
         put EMAIL_TO "$v1"
@@ -191,6 +191,15 @@ wizard() {
             ask v3 "SMTP user"; put SMTP_USER "$v3"
             ask v4 "SMTP password" silent; put SMTP_PASS "$v4"
         fi
+    fi
+    echo "  5/5 Jira connector (creates/updates an issue per alert)"
+    ask v1 "Jira base URL (e.g. https://your-org.atlassian.net)"
+    if [[ -n "$v1" ]]; then
+        put JIRA_URL "$v1"
+        ask v2 "Project key (e.g. SEC)"; put JIRA_PROJECT_KEY "$v2"
+        ask v3 "Account e-mail (Cloud; Enter = Server/DC personal access token)"; put JIRA_EMAIL "$v3"
+        ask v4 "API token" silent; put JIRA_API_TOKEN "$v4"
+        ask v2 "Issue type (Enter = Task)"; put JIRA_ISSUE_TYPE "$v2"
     fi
     echo "  Automatic updates from GitHub ($REPO_SLUG)"
     read -r -u "$TTY_FD" -p "    Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled] " v1 || v1=""

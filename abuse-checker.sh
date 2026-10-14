@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.2.0"
+readonly AC_VERSION="1.3.0"
 # Upstream repository used by --check-update / --update (override with
 # REPO_SLUG / REPO_BRANCH in the secrets store).
 readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"

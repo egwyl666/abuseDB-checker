@@ -85,7 +85,7 @@ report_file() { echo "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date '+%Y-%m-%d'
 # ---------------------------------------------------------------------------
 section "Static checks"
 for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh \
-         connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/99-custom.sh.example; do
+         connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh connectors/99-custom.sh.example; do
     if bash -n "$ROOT/$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; fi
     if command -v shellcheck >/dev/null 2>&1; then
         if shellcheck -s bash -x "$ROOT/$f" >/dev/null 2>&1; then ok "shellcheck $f"; else bad "shellcheck $f" "$(shellcheck -s bash "$ROOT/$f" | head -5)"; fi
@@ -293,7 +293,7 @@ check "custom connector payload valid" bash -c 'grep -q "\"alerts\"" "$1"' _ "$M
 check "custom *WEBHOOK* secret redacted from logs" bash -c '! grep -qF "$1" <<< "$2"' _ "$CUSTOM_URL" "$OUT"
 check "custom secret not in curl argv" bash -c '! grep -qF "$1" "$2"' _ "$CUSTOM_URL" "$MOCK_LOG/argv.log"
 run_checker --status
-check "--status lists valid connectors" grep -q "Connectors  : 10-telegram 15-failing 20-slack 25-disabled 30-email 40-custom" <<< "$OUT"
+check "--status lists valid connectors" grep -q "Connectors  : 10-telegram 15-failing 20-slack 25-disabled 30-email 40-custom 40-jira" <<< "$OUT"
 rm -f "$CD"/*.sh
 run_checker --run
 check "no connectors at all: still rc 0" test "$RC" -eq 0
@@ -466,6 +466,88 @@ OUT="$(AC_ROOT="$WORK/root" bash "$SCRIPT" --uninstall </dev/null 2>&1)"; RC=$?
 check "non-interactive without flag refuses" test "$RC" -ne 0 -a -e "$WORK/root/usr/local/bin/abuse-checker"
 OUT="$(AC_ROOT="$WORK/root" bash "$ROOT/uninstall.sh" --keep </dev/null 2>&1)"
 check "uninstall.sh --keep wrapper works" test ! -e "$WORK/root/usr/local/bin/abuse-checker" -a -e "$WORK/root/etc/abuse-checker/secrets.conf.enc"
+
+# ---------------------------------------------------------------------------
+section "Jira connector"
+setup_env
+JIRA_TOKEN="dummyJiraApiTokenATATT3xFfGF0abc123"
+cat >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf" <<JCONF
+JIRA_URL="https://jira.test"
+JIRA_EMAIL="secops@example.test"
+JIRA_API_TOKEN="$JIRA_TOKEN"
+JIRA_PROJECT_KEY="SEC"
+JIRA_ISSUE_TYPE="Bug"
+JIRA_LABELS="security, vps"
+JIRA_PRIORITY="High"
+JCONF
+JIRA_BASIC="$(printf '%s' "secops@example.test:$JIRA_TOKEN" | base64 -w0)"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+fix_ip 192.0.2.3 10 3 "2026-10-09T09:00:00+00:00"
+run_checker --run
+JP="$MOCK_LOG/jira_payloads.log"
+check "jira: run rc 0" test "$RC" -eq 0
+check "jira: searched for an open issue first (v3 search/jql)" grep -q "^GET /rest/api/3/search/jql" "$MOCK_LOG/jira.log"
+check "jira: created issue when none open" grep -q "^POST /rest/api/2/issue$" "$MOCK_LOG/jira.log"
+check "jira: logged created key" grep -q "Jira: created SEC-42" <<< "$OUT"
+check "jira: payload project key" jq -se '.[0].fields.project.key == "SEC"' "$JP"
+check "jira: payload issue type" jq -se '.[0].fields.issuetype.name == "Bug"' "$JP"
+check "jira: payload priority" jq -se '.[0].fields.priority.name == "High"' "$JP"
+check "jira: payload labels incl. host label" jq -se '.[0].fields.labels | index("abuse-checker") and index("abuse-checker-testhost") and index("security") and index("vps")' "$JP"
+check "jira: summary is the alert title" jq -se '.[0].fields.summary | test("AbuseIPDB alert for testhost: 2 IP")' "$JP"
+check "jira: description has wiki table header" jq -se '.[0].fields.description | contains("||Status||IP / Subnet||Score||")' "$JP"
+check "jira: description lists NEW IP with delta" jq -se '.[0].fields.description | contains("|NEW|{{192.0.2.2}}|55%|5 (+5)|")' "$JP"
+check "jira: description links AbuseIPDB" jq -se '.[0].fields.description | contains("[check|https://www.abuseipdb.com/check/192.0.2.2]")' "$JP"
+check "jira: description escapes ISP markup" jq -se '.[0].fields.description | contains("ISP <192.0.2.2>")' "$JP"
+check "jira: HTML report attached" grep -q "^attach /rest/api/2/issue/SEC-42/attachments" "$MOCK_LOG/jira.log"
+check "jira: Basic auth sent via stdin config" grep -qxF "Basic $JIRA_BASIC" "$MOCK_LOG/jira_authvalues.log"
+check "jira: token not in curl argv" bash -c '! grep -qF -e "$1" -e "$2" "$3"' _ "$JIRA_TOKEN" "$JIRA_BASIC" "$MOCK_LOG/argv.log"
+check "jira: token redacted from logs" bash -c '! grep -qF "$1" <<< "$2"' _ "$JIRA_TOKEN" "$OUT"
+check "jira: other connectors still delivered" grep -q sendDocument "$MOCK_LOG/notify.log"
+
+# Update mode: an open issue exists -> comment instead of a duplicate issue.
+: > "$MOCK_LOG/jira.log"; : > "$JP"
+fix_ip 192.0.2.3 30 9 "2026-10-12T09:00:00+00:00"
+MOCK_JIRA_EXISTING="SEC-7" run_checker --run
+check "jira: comments on existing open issue" grep -q "^POST /rest/api/2/issue/SEC-7/comment" "$MOCK_LOG/jira.log"
+check "jira: no duplicate issue created" bash -c '! grep -q "^POST /rest/api/2/issue$" "$1"' _ "$MOCK_LOG/jira.log"
+check "jira: comment body shows ESCALATED +6" jq -se '.[0].body | contains("|ESCALATED|{{192.0.2.3}}|30%|9 (+6)|")' "$JP"
+check "jira: report attached to existing issue" grep -q "^attach /rest/api/2/issue/SEC-7/attachments" "$MOCK_LOG/jira.log"
+check "jira: logged update" grep -q "Jira: updated SEC-7" <<< "$OUT"
+
+# Server/Data Center: v3 search missing -> v2 fallback; no e-mail -> Bearer PAT.
+: > "$MOCK_LOG/jira.log"; : > "$MOCK_LOG/jira_authvalues.log"
+sed -i '/^JIRA_EMAIL=/d' "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.3 30 12 "2026-10-13T09:00:00+00:00"
+MOCK_JIRA_V3_404=1 run_checker --run
+check "jira: falls back to /rest/api/2/search" grep -q "^GET /rest/api/2/search" "$MOCK_LOG/jira.log"
+check "jira: Bearer PAT when JIRA_EMAIL empty" grep -qxF "Bearer $JIRA_TOKEN" "$MOCK_LOG/jira_authvalues.log"
+
+# JIRA_UPDATE_MODE=create always opens a new issue, without searching.
+: > "$MOCK_LOG/jira.log"
+echo 'JIRA_UPDATE_MODE="create"' >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.3 30 15 "2026-10-14T09:00:00+00:00"
+MOCK_JIRA_EXISTING="SEC-7" run_checker --run
+check "jira create mode: no search" bash -c '! grep -q search "$1"' _ "$MOCK_LOG/jira.log"
+check "jira create mode: new issue" grep -q "^POST /rest/api/2/issue$" "$MOCK_LOG/jira.log"
+
+# API error: logged clearly, run still succeeds, other connectors unaffected.
+: > "$MOCK_LOG/notify.log"
+fix_ip 192.0.2.3 30 18 "2026-10-14T10:00:00+00:00"
+MOCK_JIRA_FAIL=1 run_checker --run
+check "jira error: run rc 0" test "$RC" -eq 0
+check "jira error: Jira's message surfaced" grep -q "Jira issue creation failed (HTTP 400): issuetype: Specify a valid issue type" <<< "$OUT"
+check "jira error: connector marked failed" grep -q "connector 40-jira failed" <<< "$OUT"
+check "jira error: Telegram still sent" grep -q sendMessage "$MOCK_LOG/notify.log"
+
+# Not configured -> silently skipped; --test-notify reaches Jira when configured.
+setup_env
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "jira unconfigured: never called" test ! -s "$MOCK_LOG/jira.log"
+printf 'JIRA_URL="https://jira.test"\nJIRA_API_TOKEN="%s"\nJIRA_PROJECT_KEY="SEC"\n' "$JIRA_TOKEN" >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+run_checker --test-notify
+check "--test-notify creates a Jira issue" grep -q "^POST /rest/api/2/issue$" "$MOCK_LOG/jira.log"
+check "--test-notify Jira summary marked TEST" jq -se 'map(select(.fields)) | .[0].fields.summary | startswith("[TEST]")' "$MOCK_LOG/jira_payloads.log"
 
 # ---------------------------------------------------------------------------
 section "Self-update: --check-update / --update / AUTO_UPDATE"

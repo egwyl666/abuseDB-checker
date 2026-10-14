@@ -15,7 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/insta
 позначену.
 
 Сповіщення можна надсилати одночасно в кілька чатів Telegram, вебхуків Slack
-та на кілька адрес електронної пошти.
+та на кілька адрес електронної пошти. Також вони можуть створювати або
+оновлювати задачу в Jira.
 
 ---
 
@@ -121,7 +122,7 @@ curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/insta
 
 ```
 abuse-checker.sh            основний скрипт (встановлюється як /usr/local/bin/abuse-checker)
-connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 99-custom.sh.example
+connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 40-jira.sh, 99-custom.sh.example
 install.sh / uninstall.sh   встановлення (з майстром налаштування) та видалення
 systemd/                    юніти сервісу й таймера
 config/                     secrets.conf.example, ips.txt.example
@@ -200,7 +201,8 @@ Would you like to configure API keys and notification connectors now? [y/N]
 2. Конектор Telegram (токен бота + ідентифікатори чатів)
 3. Конектор Slack (URL вебхуків)
 4. Конектор Email (отримувачі + URL/користувач/пароль SMTP)
-5. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]` — автоматичні оновлення з GitHub: 1 — лише сповіщати (типово), 2 — встановлювати автоматично, 3 — вимкнено
+5. Конектор Jira (базовий URL, ключ проєкту, e-mail, API-токен, тип задачі)
+6. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]` — автоматичні оновлення з GitHub: 1 — лише сповіщати (типово), 2 — встановлювати автоматично, 3 — вимкнено
 
 Токени й паролі вводяться без відображення. Кожне значення одразу потрапляє в
 зашифроване сховище через `abuse-checker --set-secret` (через stdin), тож
@@ -251,6 +253,14 @@ journalctl -u abuse-checker -n 50 --no-pager
 | `EMAIL_FROM`          | `abuse-checker@<host>` | Адреса відправника                                           |
 | `SMTP_URL`            | –               | `smtps://host:465` або `smtp://host:587` (STARTTLS обов'язковий)    |
 | `SMTP_USER`/`SMTP_PASS` | –             | Облікові дані SMTP. Без `SMTP_URL` використовується локальний `sendmail -t` |
+| `JIRA_URL`            | –               | Базовий URL Jira, наприклад `https://your-org.atlassian.net`        |
+| `JIRA_EMAIL`          | –               | E-mail облікового запису Jira Cloud (Basic auth). Порожньо = PAT для Server/DC (Bearer) |
+| `JIRA_API_TOKEN`      | –               | API-токен Cloud або персональний токен доступу Server/DC            |
+| `JIRA_PROJECT_KEY`    | –               | Проєкт для задач, наприклад `SEC`                                   |
+| `JIRA_ISSUE_TYPE`     | `Task`          | Назва типу задачі, наприклад `Bug`, `Incident`                      |
+| `JIRA_UPDATE_MODE`    | `comment`       | `comment`: оновити відкриту задачу для цього хоста; `create`: щоразу створювати нову |
+| `JIRA_LABELS` / `JIRA_PRIORITY` | –     | Додаткові мітки (через кому) та назва пріоритету                    |
+| `JIRA_ATTACH_REPORT`  | `true`          | Прикріпити HTML-звіт до задачі                                      |
 
 Безкоштовні тарифи AbuseIPDB дозволяють `check-block` лише для мереж до `/24`.
 Більші блоки розділіть або використайте `USE_CHECK_BLOCK=false` з меншим
@@ -303,6 +313,40 @@ sudo abuse-checker --test-notify
   використовують Block Kit і містять кнопку для кожної IP-адреси.
 - **Email:** один лист надсилається всім отримувачам: текстовий підсумок у
   тілі листа і HTML-звіт у вкладенні.
+- **Jira:** див. розділ [Jira](#jira) нижче.
+
+### Jira
+
+Коли спрацьовує сповіщення (є хоча б одна IP-адреса зі статусом `NEW` або
+`ESCALATED`, або використано `--force-full-report`), `40-jira.sh` робить таке:
+
+1. Шукає найновішу **відкриту** задачу в `JIRA_PROJECT_KEY` з мітками
+   `abuse-checker` і `abuse-checker-<хост>`. Для цього використовує
+   `/rest/api/3/search/jql` у Jira Cloud і переходить на `/rest/api/2/search`
+   у Server/Data Center.
+2. Якщо така задача є, **додає до неї коментар**. Якщо немає, **створює**
+   задачу, де заголовок сповіщення стає назвою задачі, з типом
+   `JIRA_ISSUE_TYPE`, мітками та необов'язковим `JIRA_PRIORITY`. Щоб щоразу
+   створювати нову задачу, встановіть `JIRA_UPDATE_MODE="create"`.
+3. Опис або коментар — це таблиця у wiki-розмітці Jira з такими стовпцями:
+   статус, IP/підмережа, оцінка, скарги з `+delta`, ISP, країна, час останньої
+   скарги та посилання на сторінку перевірки AbuseIPDB.
+4. Прикріплює `report_YYYY-MM-DD.html` до задачі (щоб вимкнути це,
+   встановіть `JIRA_ATTACH_REPORT="false"`).
+
+Коли задачу вирішено і її статус належить до категорії Done, наступне
+сповіщення створить нову задачу. У Jira Cloud задайте `JIRA_EMAIL` і
+[API-токен](https://id.atlassian.com/manage-profile/security/api-tokens);
+конектор надсилає їх як HTTP Basic auth. У Server/Data Center залиште
+`JIRA_EMAIL` порожнім і вкажіть персональний токен доступу в
+`JIRA_API_TOKEN`; він надсилається як Bearer-токен. В обох випадках токен і
+похідний заголовок `Authorization` потрапляють у curl лише через
+`--config -` (stdin), а сам токен маскується в логах.
+
+```bash
+sudo abuse-checker --edit-secrets   # JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
+sudo abuse-checker --test-notify    # створює задачу "[TEST] ..."
+```
 
 ---
 
@@ -361,6 +405,7 @@ printf '%s\n' "$VALUE" | sudo abuse-checker --set-secret SLACK_WEBHOOK_URLS   # 
 | `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
 | `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
 | `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
+| `40-jira.sh` | `JIRA_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (обов'язкові), а також `JIRA_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
 | `99-custom.sh.example` | Задокументований шаблон. Не завантажується, бо не закінчується на `.sh`. |
 
 Конектор визначає дві функції:
@@ -611,6 +656,15 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
   перериває запуск; openssl ніколи не отримує секретів в argv; у каталогах
   налаштувань, стану, RAM і tmp не лишається відкритих секретів; а також рівень
   `systemd-creds`, якщо він доступний;
+- Jira: задача створюється з правильним вмістом запиту (проєкт, тип задачі,
+  пріоритет, мітки разом із міткою хоста, назва, wiki-таблиця з `+delta` і
+  посиланнями на AbuseIPDB, текст ISP), і звіт прикріплюється; до відкритої
+  задачі додається коментар замість дубліката; перехід на
+  `/rest/api/2/search` і Bearer PAT для Server/DC; `JIRA_UPDATE_MODE=create`;
+  помилка API Jira показується, а інші конектори все одно надсилають
+  сповіщення; Jira пропускається, якщо не налаштована; `--test-notify` до неї
+  доходить; токен і заголовок Basic ніколи не потрапляють в argv, а токен
+  маскується в логах;
 - самооновлення: `--check-update` (новіша версія, та сама, GitHub
   недоступний); `--update` зі справним релізом, пошкодженим
   `abuse-checker.sh`, пошкодженим конектором, архівом-сміттям і невдалим
@@ -637,6 +691,8 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | `secrets are stored in plain text` | Виконайте `sudo abuse-checker --encrypt-secrets`. |
 | `RAM directory /dev/shm not available` | Змонтуйте tmpfs у `/dev/shm` або вкажіть інший каталог tmpfs у `ABUSE_CHECKER_RAMDIR`. |
 | `connector X: ... skipped` | Цей файл у `connectors.d` порожній, містить синтаксичну помилку або не має `connector_enabled`/`connector_send`. Виправте або видаліть його. |
+| `Jira issue creation failed (HTTP 400): ...` | Показується власна помилка Jira, часто неправильний `JIRA_ISSUE_TYPE` або обов'язкове поле, наприклад компонент. Виправте через `--edit-secrets` і повторіть із `--test-notify`. |
+| `Jira ... (HTTP 401/403)` | Неправильний `JIRA_EMAIL` чи токен, або обліковий запис не може створювати задачі в проєкті. У Server/DC залиште `JIRA_EMAIL` порожнім, щоб використати PAT. |
 | `no connector delivered the alert` | Жоден конектор не налаштовано. Перевірте рядок `Connectors` у `--status`, потім виконайте `--edit-secrets`. |
 | `IP list not readable` | Перевірте, що `ips.txt` існує і має права `0644 root:abusechecker`. Повторний запуск `install.sh` виправить права. |
 | `state directory ... does not exist` | Виконайте `sudo ./install.sh`. |

@@ -14,7 +14,7 @@ self-contained interactive HTML report, when something has changed: a newly
 flagged IP or new reports against one that was already flagged.
 
 Alerts can go to several Telegram chats, Slack webhooks and email recipients
-at once.
+at once. They can also open or update a Jira issue.
 
 ---
 
@@ -118,7 +118,7 @@ Repository layout:
 
 ```
 abuse-checker.sh            main script (installed as /usr/local/bin/abuse-checker)
-connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 99-custom.sh.example
+connectors/                 10-telegram.sh, 20-slack.sh, 30-email.sh, 40-jira.sh, 99-custom.sh.example
 install.sh / uninstall.sh   installer (with setup wizard) and remover
 systemd/                    service and timer units
 config/                     secrets.conf.example, ips.txt.example
@@ -195,7 +195,8 @@ steps. Press Enter at any prompt to skip that step:
 2. Telegram connector (bot token + chat IDs)
 3. Slack connector (webhook URLs)
 4. Email connector (recipients + SMTP URL/user/password)
-5. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]`
+5. Jira connector (base URL, project key, e-mail, API token, issue type)
+6. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]`
 
 Tokens and passwords are typed without echo. Each value goes straight into the
 encrypted store through `abuse-checker --set-secret` on stdin, so no plaintext
@@ -244,6 +245,14 @@ editor refuses anything else.
 | `EMAIL_FROM`          | `abuse-checker@<host>` | Sender address                                            |
 | `SMTP_URL`            | –               | `smtps://host:465` or `smtp://host:587` (STARTTLS enforced)      |
 | `SMTP_USER`/`SMTP_PASS` | –             | SMTP credentials. Without `SMTP_URL`, local `sendmail -t` is used |
+| `JIRA_URL`            | –               | Jira base URL, e.g. `https://your-org.atlassian.net`             |
+| `JIRA_EMAIL`          | –               | Jira Cloud account e-mail (Basic auth). Empty = Server/DC PAT (Bearer) |
+| `JIRA_API_TOKEN`      | –               | Cloud API token or Server/DC personal access token               |
+| `JIRA_PROJECT_KEY`    | –               | Project for the issues, e.g. `SEC`                               |
+| `JIRA_ISSUE_TYPE`     | `Task`          | Issue type name, e.g. `Bug`, `Incident`                          |
+| `JIRA_UPDATE_MODE`    | `comment`       | `comment`: update the open issue for this host; `create`: always open a new one |
+| `JIRA_LABELS` / `JIRA_PRIORITY` | –     | Extra labels (comma-separated) and priority name                 |
+| `JIRA_ATTACH_REPORT`  | `true`          | Attach the HTML report to the issue                              |
 
 Free AbuseIPDB plans allow `check-block` only on networks up to `/24`. For
 larger blocks, split them or use `USE_CHECK_BLOCK=false` with a smaller range.
@@ -294,6 +303,40 @@ from the list. To add a new channel type, see [Connectors](#connectors).
   button per IP.
 - **Email:** one message goes to all recipients, with the plain-text summary
   in the body and the HTML report attached.
+- **Jira:** see [Jira](#jira) below.
+
+### Jira
+
+When an alert fires (at least one `NEW` or `ESCALATED` IP, or
+`--force-full-report`), `40-jira.sh` does the following:
+
+1. It searches for the newest **open** issue in `JIRA_PROJECT_KEY` with the
+   labels `abuse-checker` and `abuse-checker-<host>`. It uses
+   `/rest/api/3/search/jql` on Jira Cloud and falls back to
+   `/rest/api/2/search` on Server/Data Center.
+2. If one exists, it **adds a comment** to it. If not, it **creates** an issue
+   with the alert title as the summary, `JIRA_ISSUE_TYPE`, the labels and an
+   optional `JIRA_PRIORITY`. Set `JIRA_UPDATE_MODE="create"` to always open a
+   new issue instead.
+3. The description or comment is a Jira wiki table with these columns: status,
+   IP/subnet, score, reports with `+delta`, ISP, country, last reported, and a
+   link to the AbuseIPDB check page.
+4. It attaches `report_YYYY-MM-DD.html` to the issue (set
+   `JIRA_ATTACH_REPORT="false"` to skip this).
+
+Once the issue is resolved and its status is in the Done category, the next
+alert opens a fresh issue. On Jira Cloud, set `JIRA_EMAIL` and an
+[API token](https://id.atlassian.com/manage-profile/security/api-tokens); the
+connector sends it as HTTP Basic auth. On Server/Data Center, leave
+`JIRA_EMAIL` empty and put a personal access token in `JIRA_API_TOKEN`; it is
+sent as a Bearer token. Either way, the token and the derived `Authorization`
+header only reach curl through `--config -` on stdin, and the token is
+redacted from logs.
+
+```bash
+sudo abuse-checker --edit-secrets   # JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
+sudo abuse-checker --test-notify    # creates a "[TEST] ..." issue
+```
 
 ---
 
@@ -350,6 +393,7 @@ own subshell**, so one failing connector cannot stop the others or the run.
 | `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
 | `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
 | `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
+| `40-jira.sh` | `JIRA_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (required), plus `JIRA_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
 | `99-custom.sh.example` | Documented template. Not loaded, because it does not end in `.sh`. |
 
 A connector defines two functions:
@@ -588,6 +632,14 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
   shredded); a wrong master key aborts; openssl never sees a secret in argv;
   no plaintext secret is left in the config, state, RAM or tmp directories;
   and the `systemd-creds` tier when available;
+- Jira: an issue is created with the right payload (project, issue type,
+  priority, labels including the host label, summary, wiki table with
+  `+delta` and AbuseIPDB links, ISP text) and the report is attached; an open
+  issue gets a comment instead of a duplicate; the Server/DC fallback to
+  `/rest/api/2/search` and Bearer PAT; `JIRA_UPDATE_MODE=create`; a Jira API
+  error is surfaced while other connectors still deliver; Jira is skipped when
+  not configured; `--test-notify` reaches it; the token and the Basic header
+  never appear in argv and the token is redacted from logs;
 - self-update: `--check-update` (newer, same, unreachable); `--update` with
   a good release, a corrupted `abuse-checker.sh`, a corrupted connector, a
   garbage archive and a failed download (each rejected, with the installed
@@ -612,6 +664,8 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `secrets are stored in plain text` | Run `sudo abuse-checker --encrypt-secrets`. |
 | `RAM directory /dev/shm not available` | Mount tmpfs on `/dev/shm`, or set `ABUSE_CHECKER_RAMDIR` to another tmpfs directory. |
 | `connector X: ... skipped` | That file in `connectors.d` is empty, has a syntax error, or lacks `connector_enabled`/`connector_send`. Fix or delete it. |
+| `Jira issue creation failed (HTTP 400): ...` | Jira's own error is shown, often a wrong `JIRA_ISSUE_TYPE` or a required field such as a component. Fix it with `--edit-secrets`, then retry with `--test-notify`. |
+| `Jira ... (HTTP 401/403)` | Wrong `JIRA_EMAIL` or token, or the account cannot create issues in the project. On Server/DC, leave `JIRA_EMAIL` empty to use a PAT. |
 | `no connector delivered the alert` | No connector is configured. Run `--status` and check the `Connectors` line, then `--edit-secrets`. |
 | `IP list not readable` | Check that `ips.txt` exists and is `0644 root:abusechecker`. Re-running `install.sh` fixes the permissions. |
 | `state directory ... does not exist` | Run `sudo ./install.sh`. |
