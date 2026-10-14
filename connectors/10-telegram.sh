@@ -12,7 +12,7 @@ connector_enabled() { [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_IDS
 
 connector_send() {
     local data="$1" report="$2" title="$3" text chat cfg ok=0 fail=0
-    text="$(jq -r --arg title "$title" --argjson force "$FORCE_FULL" '
+    text="$(jq -r --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --argjson force "$FORCE_FULL" '
         def e: tostring | gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
         def icon: {"NEW":"🔴","ESCALATED":"🟠","UNCHANGED":"🟡"}[.status] // "";
         [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
@@ -20,7 +20,8 @@ connector_send() {
         + "Checked <b>\(length)</b> · New <b>\(map(select(.status=="NEW"))|length)</b> · Escalated <b>\(map(select(.status=="ESCALATED"))|length)</b>\n\n"
         + ([$a[:25][] | "\(icon) <code>\(.target|e)</code> — \(.score)% · \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n    <i>\(.isp|e)</i>" else "" end)] | join("\n"))
         + (if ($a|length) > 25 then "\n…and \(($a|length) - 25) more (see report)" else "" end)
-        + "\n\n<i>\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted.</i>"' "$data")"
+        + "\n\n<i>\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted.</i>"
+        + (if $upd != "" then "\n⬆️ <i>\($upd|e)</i>" else "" end)' "$data")"
     while IFS= read -r chat; do
         cfg="$(cfg_line url "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")
 $(cfg_line form-string "chat_id=$chat")

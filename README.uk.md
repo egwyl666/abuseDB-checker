@@ -1,5 +1,9 @@
 # abuse-checker
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+```
+
 [English](README.md) · **Українська**
 
 Невеликий монітор AbuseIPDB для Linux-серверів із мінімумом залежностей.
@@ -128,8 +132,36 @@ tests/run_tests.sh          офлайн-набір тестів (викорис
 
 ## Встановлення
 
-Вимоги: Linux із systemd, Bash 4.4+, `curl` 7.55+, `jq` 1.6+ та `openssl`
-(systemd 250+ використовується автоматично, якщо доступний).
+### Встановлення однією командою
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+```
+
+Команда завантажує `install.sh`. Поруч із ним немає файлів репозиторію, тому
+він завантажує архів гілки `main`
+(`https://github.com/egwyl666/abuseDB-checker/archive/refs/heads/main.tar.gz`)
+у приватний каталог `mktemp -d` і розпаковує його. Потім виконує `bash -n` для
+кожного скрипта і встановлює лише тоді, коли всі перевірки пройдено.
+Тимчасовий каталог після цього видаляється. Майстер налаштування теж працює,
+бо читає відповіді з `/dev/tty`, а не з каналу.
+
+Варіанти:
+
+```bash
+# без майстра (Ansible, cloud-init, CI)
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash -s -- --non-interactive
+# інша гілка
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo AC_BRANCH=dev bash
+```
+
+Якщо хочете спочатку переглянути скрипт:
+`curl -fsSLO https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh && less install.sh && sudo bash install.sh`.
+
+### Із git clone
+
+Вимоги: Linux із systemd, Bash 4.4+, `curl` 7.55+, `jq` 1.6+, `tar` та
+`openssl` (systemd 250+ використовується автоматично, якщо доступний).
 
 ```bash
 # Debian/Ubuntu
@@ -137,7 +169,7 @@ sudo apt install -y curl jq openssl
 # RHEL/Alma/Rocky/Fedora
 sudo dnf install -y curl jq openssl
 
-git clone <цей репозиторій> abuse-checker && cd abuse-checker
+git clone https://github.com/egwyl666/abuseDB-checker.git abuse-checker && cd abuse-checker
 bash tests/run_tests.sh          # необов'язково: спочатку запустити офлайн-тести
 sudo ./install.sh                # створює користувача, каталоги, юніти, зашифроване сховище; вмикає таймер
 ```
@@ -147,7 +179,7 @@ sudo ./install.sh                # створює користувача, кат
 Параметри:
 
 - `--no-enable`: встановити без запуску таймера;
-- `--non-interactive` (`-n`): ніколи не показувати майстер налаштування
+- `--non-interactive` (`--no-wizard`, `-n`): ніколи не показувати майстер налаштування
   (він також автоматично пропускається без TTY, наприклад в Ansible чи
   cloud-init).
 
@@ -168,6 +200,7 @@ Would you like to configure API keys and notification connectors now? [y/N]
 2. Конектор Telegram (токен бота + ідентифікатори чатів)
 3. Конектор Slack (URL вебхуків)
 4. Конектор Email (отримувачі + URL/користувач/пароль SMTP)
+5. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]` — автоматичні оновлення з GitHub: 1 — лише сповіщати (типово), 2 — встановлювати автоматично, 3 — вимкнено
 
 Токени й паролі вводяться без відображення. Кожне значення одразу потрапляє в
 зашифроване сховище через `abuse-checker --set-secret` (через stdin), тож
@@ -209,6 +242,8 @@ journalctl -u abuse-checker -n 50 --no-pager
 | `REQUEST_DELAY`       | `0`             | Пауза в секундах між запитами до API                                |
 | `RETENTION_DAYS`      | `30`            | Видаляти звіти, старші за цю кількість днів                         |
 | `HOST_LABEL`          | ім'я хоста      | Назва, що показується в сповіщеннях і звітах                        |
+| `AUTO_UPDATE`         | `notify`        | `notify`, `true` (автовстановлення) або `false`; див. [Оновлення](#оновлення) |
+| `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Джерело для `--check-update` і `--update`          |
 | `TELEGRAM_BOT_TOKEN`  | –               | Токен бота від @BotFather                                           |
 | `TELEGRAM_CHAT_IDS`   | –               | Ідентифікатори чатів через кому (особисті й групи; у груп від'ємні) |
 | `SLACK_WEBHOOK_URLS`  | –               | URL вхідних вебхуків через кому                                     |
@@ -360,6 +395,7 @@ connector_send      # $1 = класифікований JSON, $2 = report.html, 
 ```
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
 abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
+abuse-checker [--check-update | --update [--force]]
 ```
 
 | Прапорець             | Дія |
@@ -373,6 +409,8 @@ abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninsta
 | `--edit-secrets`      | Лише root. Розшифрувати в RAM, відредагувати, перевірити, зашифрувати, знищити копію. Див. [Зашифровані секрети](#зашифровані-секрети). |
 | `--encrypt-secrets`   | Лише root. Перенести звичайний `secrets.conf` у зашифроване сховище і знищити оригінал. |
 | `--set-secret KEY`    | Лише root. Задати одну змінну, значення читається зі stdin (воно ніколи не з'являється в `ps`). |
+| `--check-update`      | Порівняти встановлену версію з останньою на GitHub. |
+| `--update`, `--self-update` | Лише root. Завантажити, перевірити (`bash -n`) і встановити останню версію (`--force` перевстановлює). Див. [Оновлення](#оновлення). |
 | `--uninstall`         | Лише root. Інтерактивне меню або `--keep` / `--purge` для скриптів. Див. [Видалення](#видалення). |
 | `--help`, `--version` | Показує довідку або версію. |
 
@@ -406,18 +444,48 @@ OnCalendar=*-*-* 07:30:00
 
 ## Оновлення
 
+Основний репозиторій —
+[`egwyl666/abuseDB-checker`](https://github.com/egwyl666/abuseDB-checker),
+гілка `main`.
+
 ```bash
-cd abuse-checker && git pull
-bash tests/run_tests.sh
-sudo ./install.sh
+sudo abuse-checker --check-update    # порівняти встановлену версію з останньою на GitHub
+sudo abuse-checker --update          # те саме, що --self-update; --force перевстановлює
 ```
 
-Інсталятор атомарно замінює виконуваний файл і оновлює юніти, вбудовані
-конектори та `secrets.conf.example`. Ваші секрети, список IP-адрес, стан і
-власні конектори залишаються без змін. Порівняйте `secrets.conf.example` із
-вмістом `sudo abuse-checker --edit-secrets`, щоб знайти нові параметри. Якщо
-ви оновлюєтеся з версії 1.0 зі звичайним `secrets.conf`, завершіть
-оновлення командою `sudo abuse-checker --encrypt-secrets`.
+`--update` працює так:
+
+1. Завантажує архів гілки в приватний тимчасовий каталог.
+2. Виконує `bash -n` для завантажених `abuse-checker.sh`, `install.sh` і
+   кожного конектора та зчитує новий `AC_VERSION`. Якщо будь-яка перевірка
+   не пройшла, зупиняється **ще до будь-яких змін у системі**, і встановлена
+   версія продовжує працювати.
+3. Запускає новий `install.sh --no-wizard`. Він атомарно замінює виконуваний
+   файл і оновлює конектори та юніти systemd. Ваші секрети, `ips.txt`,
+   `state.json`, звіти й власні конектори зберігаються.
+
+Встановлення однією командою робить те саме, і його можна безпечно
+повторювати. Із робочої копії репозиторію також можна виконати
+`git pull && sudo ./install.sh`.
+
+### Автоматичні оновлення (`AUTO_UPDATE`)
+
+Задається через `sudo abuse-checker --edit-secrets` або в майстрі
+налаштування.
+
+| Значення | Поведінка |
+|----------|-----------|
+| `notify` (типово) | Раз на день під час запланованого запуску перевіряє GitHub; результат кешується в `/var/lib/abuse-checker/update-check.json`. Якщо є новіша версія, записує це в лог і додає `Update available: vX.Y.Z -> Run 'sudo abuse-checker --update'` до HTML-звіту, нижньої частини повідомлень Telegram і Slack та тексту листа. |
+| `true` | Перед щоденною перевіркою `ExecStartPre=-+/usr/local/bin/abuse-checker --auto-update` запускається від root поза пісочницею і встановлює новішу версію з тими самими перевірками, що й `--update`. Невдале чи відхилене оновлення записується в лог і ніколи не блокує перевірку. |
+| `false` | Заплановані запуски ніколи не звертаються до GitHub. |
+
+`REPO_SLUG` і `REPO_BRANCH` дозволяють вказати форк або іншу гілку.
+`abuse-checker --status` показує поточну політику та останню знайдену версію.
+
+Якщо ви оновлюєтеся з версії 1.0 зі звичайним `secrets.conf`, завершіть
+оновлення командою `sudo abuse-checker --encrypt-secrets`. Щоб знайти нові
+параметри, порівняйте `/etc/abuse-checker/secrets.conf.example` із вмістом
+`sudo abuse-checker --edit-secrets`.
 
 ---
 
@@ -485,6 +553,12 @@ sudo ./uninstall.sh [--keep|--purge]     # те саме з робочої ко�
   Застарілий звичайний `secrets.conf` має бути `0600`, і скрипт
   відмовляється підключати його, якщо файл доступний для запису всім. Стан і
   звіти мають права `0640` і `0750` відповідно.
+- **Перевірені оновлення.** Оновлення надходять лише з налаштованого
+  репозиторію GitHub через HTTPS. Вони розпаковуються в приватний тимчасовий
+  каталог і проходять перевірку синтаксису ще до встановлення. Єдиний крок,
+  що виконується від root поза пісочницею, — попередній крок для
+  `AUTO_UPDATE=true` (префікс `+`). Він нічого не робить, якщо цей режим
+  вимкнено. Використовуйте `notify`, якщо хочете самі переглядати зміни.
 - **Ізольовані конектори.** Кожен конектор виконується у власній
   підоболонці після перевірки синтаксису та інтерфейсу.
 - **Безпека HTML.** Кожне значення з API екранується (`@html`) перед
@@ -537,6 +611,16 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
   перериває запуск; openssl ніколи не отримує секретів в argv; у каталогах
   налаштувань, стану, RAM і tmp не лишається відкритих секретів; а також рівень
   `systemd-creds`, якщо він доступний;
+- самооновлення: `--check-update` (новіша версія, та сама, GitHub
+  недоступний); `--update` зі справним релізом, пошкодженим
+  `abuse-checker.sh`, пошкодженим конектором, архівом-сміттям і невдалим
+  завантаженням (кожен відхиляється, а встановлений файл лишається
+  побайтово незмінним); та сама версія і `--force`; `AUTO_UPDATE=notify`
+  (банер у звіті, Telegram, Slack і листі, одна перевірка на день), `false`
+  (жодного запиту до GitHub) і `true` (`--auto-update` встановлює, а
+  пошкоджене оновлення ніколи не ламає сервіс); початкове завантаження
+  через `install.sh` з каналу (завантаження, перевірка, відхилення,
+  прибирання);
 - `--uninstall` у фіктивному корені: текст меню та шляхи, скасування, `[1]`,
   `[2]` з введеним підтвердженням і без нього, відмова без TTY, а також
   обгортка `uninstall.sh`.
@@ -565,6 +649,9 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | Пошта не доставляється | Перевірте `SMTP_URL`, порт і облікові дані. Для Gmail використовуйте пароль застосунку. Без `SMTP_URL` потрібен робочий локальний `sendmail`. |
 | Сповіщень немає взагалі | Це нормально, поки нічого не змінюється. Перевірте через `--force-full-report` або `--test-notify`. |
 | Забагато сповіщень `NEW` після скидання | Очікувано: `--reset-state` стирає історію. |
+| `update check failed: HTTP ...` | GitHub недоступний або `REPO_SLUG`/`REPO_BRANCH` неправильні. Перевірка повториться наступного дня, більше ні на що це не впливає. |
+| `... fails 'bash -n'; update rejected` | Гілка в репозиторії зламана. Встановлена версія продовжує працювати. Спробуйте пізніше або зафіксуйте `REPO_BRANCH`. |
+| `curl ... install.sh \| sudo bash` повертає 404 | Гілки `main` (ще) немає. Використайте `sudo AC_BRANCH=<гілка> bash`. |
 | `--edit-secrets` повідомляє `invalid line(s)` | Використовуйте `KEY="value"` або `KEY='value'` без `$(...)`, зворотних лапок і `;`. |
 | Пошкоджений `state.json` | Скрипт запише попередження в лог і автоматично почне з чистого стану. Також можна виконати `--reset-state`. |
 

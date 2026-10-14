@@ -1,5 +1,9 @@
 # abuse-checker
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+```
+
 **English** · [Українська](README.uk.md)
 
 A small, dependency-light AbuseIPDB monitor for Linux servers. It is written in
@@ -125,8 +129,36 @@ tests/run_tests.sh          offline test suite (uses tests/mock_curl.sh)
 
 ## Installation
 
-Requirements: a systemd-based Linux, Bash 4.4+, `curl` 7.55+, `jq` 1.6+ and
-`openssl` (systemd 250+ is used automatically when available).
+### One-line install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+```
+
+This downloads `install.sh`. Because there are no repository files next to it,
+it fetches the tarball of the `main` branch
+(`https://github.com/egwyl666/abuseDB-checker/archive/refs/heads/main.tar.gz`)
+into a private `mktemp -d` directory and extracts it. It then runs `bash -n` on
+every script and only installs if all of them pass. The temporary directory is
+removed afterwards. The setup wizard still works, because it reads your
+answers from `/dev/tty` rather than from the pipe.
+
+Variants:
+
+```bash
+# no wizard (Ansible, cloud-init, CI)
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash -s -- --non-interactive
+# another branch
+curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo AC_BRANCH=dev bash
+```
+
+If you prefer to read the script first:
+`curl -fsSLO https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh && less install.sh && sudo bash install.sh`.
+
+### From a git clone
+
+Requirements: a systemd-based Linux, Bash 4.4+, `curl` 7.55+, `jq` 1.6+,
+`tar` and `openssl` (systemd 250+ is used automatically when available).
 
 ```bash
 # Debian/Ubuntu
@@ -134,7 +166,7 @@ sudo apt install -y curl jq openssl
 # RHEL/Alma/Rocky/Fedora
 sudo dnf install -y curl jq openssl
 
-git clone <this repo> abuse-checker && cd abuse-checker
+git clone https://github.com/egwyl666/abuseDB-checker.git abuse-checker && cd abuse-checker
 bash tests/run_tests.sh          # optional: run the offline test suite first
 sudo ./install.sh                # creates user, dirs, units, encrypted store; enables the timer
 ```
@@ -144,7 +176,7 @@ sudo ./install.sh                # creates user, dirs, units, encrypted store; e
 Options:
 
 - `--no-enable`: install without starting the timer;
-- `--non-interactive` (`-n`): never show the setup wizard (also skipped
+- `--non-interactive` (`--no-wizard`, `-n`): never show the setup wizard (also skipped
   automatically when there is no TTY, e.g. in Ansible or cloud-init).
 
 ### Setup wizard
@@ -163,6 +195,7 @@ steps. Press Enter at any prompt to skip that step:
 2. Telegram connector (bot token + chat IDs)
 3. Slack connector (webhook URLs)
 4. Email connector (recipients + SMTP URL/user/password)
+5. `Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled]`
 
 Tokens and passwords are typed without echo. Each value goes straight into the
 encrypted store through `abuse-checker --set-secret` on stdin, so no plaintext
@@ -202,6 +235,8 @@ editor refuses anything else.
 | `REQUEST_DELAY`       | `0`             | Seconds to sleep between API calls                               |
 | `RETENTION_DAYS`      | `30`            | Delete reports older than this                                   |
 | `HOST_LABEL`          | hostname        | Name shown in alerts and reports                                 |
+| `AUTO_UPDATE`         | `notify`        | `notify`, `true` (auto-install) or `false`; see [Updating](#updating) |
+| `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Source for `--check-update` and `--update`         |
 | `TELEGRAM_BOT_TOKEN`  | –               | Bot token from @BotFather                                        |
 | `TELEGRAM_CHAT_IDS`   | –               | Comma-separated chat ids (DMs and groups; groups are negative)   |
 | `SLACK_WEBHOOK_URLS`  | –               | Comma-separated incoming webhook URLs                            |
@@ -349,6 +384,7 @@ yours untouched.
 ```
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
 abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
+abuse-checker [--check-update | --update [--force]]
 ```
 
 | Flag                  | Effect |
@@ -362,6 +398,8 @@ abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninsta
 | `--edit-secrets`      | Root only. Decrypt into RAM, edit, validate, re-encrypt, shred. See [Encrypted secrets](#encrypted-secrets). |
 | `--encrypt-secrets`   | Root only. Move a plain-text `secrets.conf` into the encrypted store and shred the original. |
 | `--set-secret KEY`    | Root only. Set one variable, reading the value from stdin (it never appears in `ps`). |
+| `--check-update`      | Compare the installed version with the latest on GitHub. |
+| `--update`, `--self-update` | Root only. Download, verify (`bash -n`) and install the latest version (`--force` reinstalls). See [Updating](#updating). |
 | `--uninstall`         | Root only. Interactive menu, or `--keep` / `--purge` for scripts. See [Uninstalling](#uninstalling). |
 | `--help`, `--version` | Show usage or the version. |
 
@@ -394,18 +432,47 @@ OnCalendar=*-*-* 07:30:00
 
 ## Updating
 
+The upstream repository is
+[`egwyl666/abuseDB-checker`](https://github.com/egwyl666/abuseDB-checker),
+branch `main`.
+
 ```bash
-cd abuse-checker && git pull
-bash tests/run_tests.sh
-sudo ./install.sh
+sudo abuse-checker --check-update    # installed vs latest version on GitHub
+sudo abuse-checker --update          # same as --self-update; add --force to reinstall
 ```
 
-The installer replaces the binary atomically and refreshes the units, the
-bundled connectors and `secrets.conf.example`. Your secrets, IP list, state
-and custom connectors are left alone. Compare `secrets.conf.example` with
-`sudo abuse-checker --edit-secrets` to find new settings. If you upgrade from
-1.0 with a plain `secrets.conf`, finish with
-`sudo abuse-checker --encrypt-secrets`.
+`--update` works like this:
+
+1. It downloads the branch tarball into a private temporary directory.
+2. It runs `bash -n` on the downloaded `abuse-checker.sh`, `install.sh` and
+   every connector, and reads the new `AC_VERSION`. If any check fails, it
+   stops **before touching the system**, and the installed version keeps
+   working.
+3. It runs the new `install.sh --no-wizard`. That replaces the binary
+   atomically and refreshes the connectors and systemd units. Your secrets,
+   `ips.txt`, `state.json`, reports and custom connectors are kept.
+
+The one-line installer does the same job and is safe to re-run. From a clone,
+you can still use `git pull && sudo ./install.sh`.
+
+### Automatic updates (`AUTO_UPDATE`)
+
+Set this with `sudo abuse-checker --edit-secrets`, or in the setup wizard.
+
+| Value | Behaviour |
+|-------|-----------|
+| `notify` (default) | Once a day during the scheduled run, it checks GitHub; the result is cached in `/var/lib/abuse-checker/update-check.json`. If a newer version exists, it logs it and adds `Update available: vX.Y.Z -> Run 'sudo abuse-checker --update'` to the HTML report, the Telegram and Slack footers and the email body. |
+| `true` | Before the daily check, `ExecStartPre=-+/usr/local/bin/abuse-checker --auto-update` runs as root, outside the sandbox, and applies a newer version with the same verification as `--update`. A failed or rejected update is logged and never blocks the check. |
+| `false` | Scheduled runs never contact GitHub. |
+
+`REPO_SLUG` and `REPO_BRANCH` can point the updater at a fork or another
+branch. `abuse-checker --status` shows the current policy and the latest
+version it has seen.
+
+If you upgrade from 1.0 with a plain `secrets.conf`, finish with
+`sudo abuse-checker --encrypt-secrets`. To check for new settings, compare
+`/etc/abuse-checker/secrets.conf.example` with
+`sudo abuse-checker --edit-secrets`.
 
 ---
 
@@ -467,6 +534,12 @@ directories. Without a TTY the command refuses to guess; pass `--keep` or
   them to the service through its private credentials directory. A legacy
   plain `secrets.conf` must be `0600`, and the script refuses to source it if
   it is world-writable. State and reports are `0640` and `0750` respectively.
+- **Verified updates.** Updates come only from the configured GitHub
+  repository over HTTPS. They are unpacked in a private temp directory and
+  syntax-checked before anything is installed. The only step that runs as
+  root outside the sandbox is the `AUTO_UPDATE=true` pre-step (`+` prefix).
+  It does nothing unless that mode is on. Use `notify` if you want to review
+  changes yourself.
 - **Isolated connectors.** Each connector runs in its own subshell, after
   syntax and interface checks.
 - **HTML safety.** Every value from the API is HTML-escaped (`@html`) before
@@ -515,6 +588,14 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
   shredded); a wrong master key aborts; openssl never sees a secret in argv;
   no plaintext secret is left in the config, state, RAM or tmp directories;
   and the `systemd-creds` tier when available;
+- self-update: `--check-update` (newer, same, unreachable); `--update` with
+  a good release, a corrupted `abuse-checker.sh`, a corrupted connector, a
+  garbage archive and a failed download (each rejected, with the installed
+  binary byte-for-byte unchanged); same-version and `--force`;
+  `AUTO_UPDATE=notify` (banner in the report, Telegram, Slack and email, one
+  check per day), `false` (no GitHub request) and `true` (`--auto-update`
+  installs, and a corrupted update never fails the service); the piped
+  `install.sh` bootstrap (download, verify, reject, clean up);
 - `--uninstall` in a fake root: the menu text and paths, cancel, `[1]`,
   `[2]` with and without typed confirmation, refusal without a TTY, and the
   `uninstall.sh` wrapper.
@@ -543,6 +624,9 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | Email not delivered | Check `SMTP_URL`, the port and the credentials. For Gmail, use an app password. Without `SMTP_URL`, a working local `sendmail` is required. |
 | No alerts ever | That is expected while nothing changes. Check with `--force-full-report` or `--test-notify`. |
 | Too many `NEW` alerts after a reset | Expected: `--reset-state` forgets history. |
+| `update check failed: HTTP ...` | GitHub is unreachable, or `REPO_SLUG`/`REPO_BRANCH` is wrong. The check runs again the next day, and nothing else is affected. |
+| `... fails 'bash -n'; update rejected` | The upstream branch is broken. Your installed version keeps running. Try again later or pin `REPO_BRANCH`. |
+| `curl ... install.sh \| sudo bash` returns 404 | The `main` branch does not exist (yet). Use `sudo AC_BRANCH=<branch> bash`. |
 | `--edit-secrets` reports `invalid line(s)` | Use `KEY="value"` or `KEY='value'`, with no `$(...)`, backticks or `;`. |
 | Corrupt `state.json` | The script logs a warning and starts fresh automatically. You can also run `--reset-state`. |
 

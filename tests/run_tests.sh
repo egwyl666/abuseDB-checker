@@ -60,6 +60,9 @@ EOF
     export ABUSE_CHECKER_DROPIN_DIR="$WORK/env/dropin"
     export ABUSE_CHECKER_CRYPTO=openssl
     export TMPDIR="$WORK/env/tmp"
+    export ABUSE_CHECKER_GITHUB_RAW="https://raw.githubusercontent.test/owner/repo/main"
+    export ABUSE_CHECKER_GITHUB_ARCHIVE="https://github.test/owner/repo/archive/refs/heads/main.tar.gz"
+    unset MOCK_REMOTE_SCRIPT MOCK_TARBALL AUTO_UPDATE ABUSE_CHECKER_UPDATE_INSTALLER
 }
 
 fix_ip() { # ip score total last
@@ -463,6 +466,133 @@ OUT="$(AC_ROOT="$WORK/root" bash "$SCRIPT" --uninstall </dev/null 2>&1)"; RC=$?
 check "non-interactive without flag refuses" test "$RC" -ne 0 -a -e "$WORK/root/usr/local/bin/abuse-checker"
 OUT="$(AC_ROOT="$WORK/root" bash "$ROOT/uninstall.sh" --keep </dev/null 2>&1)"
 check "uninstall.sh --keep wrapper works" test ! -e "$WORK/root/usr/local/bin/abuse-checker" -a -e "$WORK/root/etc/abuse-checker/secrets.conf.enc"
+
+# ---------------------------------------------------------------------------
+section "Self-update: --check-update / --update / AUTO_UPDATE"
+setup_env
+CUR_VER="$(sed -n 's/^readonly AC_VERSION="\(.*\)"$/\1/p' "$SCRIPT")"
+mk_release() { # dir-name version [corrupt-target]
+    local d="$WORK/rel/$1/abuseDB-checker-main"
+    rm -rf "$WORK/rel/$1"; mkdir -p "$d"
+    cp -r "$ROOT/abuse-checker.sh" "$ROOT/install.sh" "$ROOT/uninstall.sh" "$ROOT/connectors" \
+          "$ROOT/systemd" "$ROOT/config" "$d/"
+    sed -i "s/^readonly AC_VERSION=\".*\"$/readonly AC_VERSION=\"$2\"/" "$d/abuse-checker.sh"
+    [[ -n "${3:-}" ]] && printf '\nif then fi\n' >> "$d/$3"
+    tar -czf "$WORK/rel/$1.tar.gz" -C "$WORK/rel/$1" abuseDB-checker-main
+    cp "$d/abuse-checker.sh" "$WORK/rel/$1.remote.sh"
+}
+mk_release good 9.9.9
+mk_release same "$CUR_VER"
+mk_release badscript 9.9.9 abuse-checker.sh
+mk_release badconn 9.9.9 connectors/20-slack.sh
+printf 'this is not a tarball' > "$WORK/rel/garbage.tar.gz"
+
+# A fake "installed" binary plus an installer stub standing in for install.sh.
+INSTALLED="$WORK/installed/abuse-checker"
+mkdir -p "$WORK/installed"; cp "$SCRIPT" "$INSTALLED"; cp "$INSTALLED" "$WORK/installed.orig"
+cat > "$WORK/installer_stub.sh" <<STUB
+#!/usr/bin/env bash
+echo "\$1" >> "$WORK/installer.log"
+cp "\$1/abuse-checker.sh" "$INSTALLED"
+STUB
+chmod +x "$WORK/installer_stub.sh"
+export ABUSE_CHECKER_UPDATE_INSTALLER="$WORK/installer_stub.sh"
+upd() { OUT="$(bash "$INSTALLED" "$@" 2>&1)"; RC=$?; }
+reset_installed() { cp "$WORK/installed.orig" "$INSTALLED"; rm -f "$WORK/installer.log"; }
+
+MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" upd --check-update
+check "--check-update shows installed version" grep -q "Installed : v$CUR_VER" <<< "$OUT"
+check "--check-update finds newer v9.9.9" grep -q "Update available -> run: sudo abuse-checker --update" <<< "$OUT"
+check "--check-update queried raw abuse-checker.sh" grep -q "raw.githubusercontent.test/owner/repo/main/abuse-checker.sh" "$MOCK_LOG/update.log"
+MOCK_REMOTE_SCRIPT="$WORK/rel/same.remote.sh" upd --check-update
+check "--check-update: same version is up to date" grep -q "Up to date." <<< "$OUT"
+upd --check-update
+check "--check-update: GitHub unreachable -> error, rc!=0" bash -c '[[ $1 -ne 0 ]] && grep -q "could not determine" <<< "$2"' _ "$RC" "$OUT"
+
+reset_installed
+MOCK_TARBALL="$WORK/rel/good.tar.gz" upd --update
+check "--update good release: rc 0" test "$RC" -eq 0
+check "--update ran installer on verified tree" grep -q "abuseDB-checker-main" "$WORK/installer.log"
+check "--update installed v9.9.9" grep -q 'AC_VERSION="9.9.9"' "$INSTALLED"
+check "--update logged version change" grep -q "updated v$CUR_VER -> v9.9.9" <<< "$OUT"
+check "--update temp dir cleaned up" test -z "$(ls -A "$TMPDIR")"
+reset_installed
+MOCK_TARBALL="$WORK/rel/good.tar.gz" upd --self-update
+check "--self-update alias works" grep -q 'AC_VERSION="9.9.9"' "$INSTALLED"
+
+reset_installed
+MOCK_TARBALL="$WORK/rel/badscript.tar.gz" upd --update
+check "corrupted remote script: rejected (rc!=0)" test "$RC" -ne 0
+check "corrupted remote script: clear message" grep -q "abuse-checker.sh fails 'bash -n'; update rejected" <<< "$OUT"
+check "corrupted remote script: installer NOT run" test ! -e "$WORK/installer.log"
+check "corrupted remote script: installed binary untouched" cmp -s "$INSTALLED" "$WORK/installed.orig"
+check "installed binary still works afterwards" bash "$INSTALLED" --version
+MOCK_TARBALL="$WORK/rel/badconn.tar.gz" upd --update
+check "corrupted remote connector: rejected" bash -c '[[ $1 -ne 0 ]] && grep -q "20-slack.sh fails" <<< "$2"' _ "$RC" "$OUT"
+check "corrupted remote connector: binary untouched" cmp -s "$INSTALLED" "$WORK/installed.orig"
+MOCK_TARBALL="$WORK/rel/garbage.tar.gz" upd --update
+check "garbage archive: rejected, untouched" bash -c '[[ $1 -ne 0 ]] && cmp -s "$2" "$3"' _ "$RC" "$INSTALLED" "$WORK/installed.orig"
+upd --update
+check "download failure: rejected, untouched" bash -c '[[ $1 -ne 0 ]] && cmp -s "$2" "$3"' _ "$RC" "$INSTALLED" "$WORK/installed.orig"
+MOCK_TARBALL="$WORK/rel/same.tar.gz" upd --update
+check "same version: already up to date, no install" bash -c 'grep -q "already up to date" <<< "$1" && [[ ! -e "$2" ]]' _ "$OUT" "$WORK/installer.log"
+MOCK_TARBALL="$WORK/rel/same.tar.gz" upd --update --force
+check "--update --force reinstalls same version" test -e "$WORK/installer.log"
+
+# AUTO_UPDATE=notify (default): banner in report, Telegram, Slack, email.
+reset_installed
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+: > "$MOCK_LOG/update.log"
+MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" run_checker --run
+NOTICE="Update available: v9.9.9 -> Run 'sudo abuse-checker --update'"
+check "notify: logged" grep -qF "$NOTICE" <<< "$OUT"
+check "notify: banner in HTML report" grep -qF "Update available: v9.9.9 -&gt; Run 'sudo abuse-checker --update'" "$(report_file)"
+check "notify: in Telegram message" grep -qF "Update available: v9.9.9 -&gt; Run" "$MOCK_LOG/config.log"
+check "notify: in Slack footer" grep -qF "$NOTICE" "$MOCK_LOG/slack_payload.log"
+check "notify: nothing installed" test ! -e "$WORK/installer.log"
+check "notify: check cached in state dir" jq -e '.latest == "9.9.9"' "$ABUSE_CHECKER_STATE_DIR/update-check.json"
+MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" run_checker --run
+check "notify: only one GitHub check per day" test "$(grep -c 'abuse-checker.sh$' "$MOCK_LOG/update.log")" -eq 1
+MOCK_REMOTE_SCRIPT="$WORK/rel/same.remote.sh" run_checker --run
+check "notify: cached result still shown same day" grep -qF "$NOTICE" <<< "$OUT"
+rm -f "$ABUSE_CHECKER_STATE_DIR/update-check.json"
+MOCK_REMOTE_SCRIPT="$WORK/rel/same.remote.sh" run_checker --run
+check "notify: no banner when up to date" bash -c '! grep -q "Update available" <<< "$1"' _ "$OUT"
+run_checker --run
+check "notify: GitHub unreachable does not break the run" test "$RC" -eq 0
+
+# AUTO_UPDATE=false: never contacts GitHub.
+rm -f "$ABUSE_CHECKER_STATE_DIR/update-check.json"; : > "$MOCK_LOG/update.log"
+AUTO_UPDATE=false MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" run_checker --run
+check "false: no GitHub request" test ! -s "$MOCK_LOG/update.log"
+check "false: no banner" bash -c '! grep -q "Update available" <<< "$1"' _ "$OUT"
+AUTO_UPDATE=false MOCK_TARBALL="$WORK/rel/good.tar.gz" MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" upd --auto-update
+check "false: --auto-update does nothing" test ! -e "$WORK/installer.log"
+AUTO_UPDATE=notify MOCK_TARBALL="$WORK/rel/good.tar.gz" MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" upd --auto-update
+check "notify: --auto-update does not install" test ! -e "$WORK/installer.log"
+
+# AUTO_UPDATE=true: --auto-update (ExecStartPre=+) installs verified updates.
+rm -f "$ABUSE_CHECKER_STATE_DIR/update-check.json"
+AUTO_UPDATE=true MOCK_TARBALL="$WORK/rel/good.tar.gz" MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" upd --auto-update
+check "true: --auto-update installs v9.9.9" bash -c '[[ $1 -eq 0 ]] && grep -q "AC_VERSION=\"9.9.9\"" "$2"' _ "$RC" "$INSTALLED"
+reset_installed; rm -f "$ABUSE_CHECKER_STATE_DIR/update-check.json"
+AUTO_UPDATE=true MOCK_TARBALL="$WORK/rel/badscript.tar.gz" MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" upd --auto-update
+check "true: corrupted update never fails the service (rc 0)" test "$RC" -eq 0
+check "true: corrupted update keeps old binary" cmp -s "$INSTALLED" "$WORK/installed.orig"
+check "true: failure is logged" grep -q "automatic update failed" <<< "$OUT"
+unset ABUSE_CHECKER_UPDATE_INSTALLER
+
+section "One-line installer bootstrap (curl | bash)"
+mkdir -p "$WORK/elsewhere"
+BOOT_OUT="$(cd "$WORK/elsewhere" && MOCK_TARBALL="$WORK/rel/good.tar.gz" ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash < "$ROOT/install.sh" 2>&1)"; RC=$?
+check "piped install.sh downloads + verifies tarball" bash -c '[[ $1 -eq 0 ]] && grep -q "bootstrap verified" <<< "$2"' _ "$RC" "$BOOT_OUT"
+check "bootstrap used the archive URL" grep -q "github.test/owner/repo/archive/refs/heads/main.tar.gz" "$MOCK_LOG/update.log"
+BOOT_OUT="$(cd "$WORK/elsewhere" && MOCK_TARBALL="$WORK/rel/badscript.tar.gz" ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash < "$ROOT/install.sh" 2>&1)"; RC=$?
+check "bootstrap rejects corrupted archive" bash -c '[[ $1 -ne 0 ]] && grep -q "syntax check failed" <<< "$2"' _ "$RC" "$BOOT_OUT"
+BOOT_OUT="$(cd "$WORK/elsewhere" && ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash < "$ROOT/install.sh" 2>&1)"; RC=$?
+check "bootstrap reports download failure" bash -c '[[ $1 -ne 0 ]] && grep -q "download failed" <<< "$2"' _ "$RC" "$BOOT_OUT"
+check "bootstrap leaves no temp dirs" test -z "$(ls -A "$TMPDIR")"
+check "wizard reads answers from /dev/tty" grep -q 'exec 3</dev/tty' "$ROOT/install.sh"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

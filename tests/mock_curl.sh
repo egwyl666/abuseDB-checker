@@ -29,6 +29,18 @@ respond() { # code body [remaining]
 }
 
 case "$url" in
+    */abuse-checker.sh)          # self-update: remote version probe
+        echo "$url" >> "$MOCK_LOG/update.log"
+        if [[ -n "${MOCK_REMOTE_SCRIPT:-}" && -f "$MOCK_REMOTE_SCRIPT" ]]; then
+            respond 200 "$(cat "$MOCK_REMOTE_SCRIPT")"
+        else
+            respond 404 'Not Found'
+        fi
+        exit 0 ;;
+    *.tar.gz)                    # self-update / bootstrap: repository tarball
+        echo "$url" >> "$MOCK_LOG/update.log"
+        [[ -n "${MOCK_TARBALL:-}" && -f "$MOCK_TARBALL" ]] || { echo "curl: (22) 404" >&2; exit 22; }
+        cp "$MOCK_TARBALL" "$out"; exit 0 ;;
     *api.telegram.org*|*hooks.slack.test*|smtp*)
         echo "$url" >> "$MOCK_LOG/notify.log"
         [[ -n "$data" ]] && cat "${data#@}" >> "$MOCK_LOG/slack_payload.log"

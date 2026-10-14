@@ -4,7 +4,11 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.1.0"
+readonly AC_VERSION="1.2.0"
+# Upstream repository used by --check-update / --update (override with
+# REPO_SLUG / REPO_BRANCH in the secrets store).
+readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"
+readonly DEFAULT_REPO_BRANCH="main"
 
 # ---------------------------------------------------------------------------
 # Paths (overridable through the environment, mainly for tests)
@@ -407,6 +411,9 @@ render_report() {
         + "<td data-v=\"\(.last // "")\">\((.last // "-") | sub("T"; " ") | sub("\\+00:00$"; " UTC") | @html)</td>"
         + "<td><a class=\"btn\" target=\"_blank\" rel=\"noopener\" href=\"https://www.abuseipdb.com/check/\(.target|@uri)\">AbuseIPDB</a></td></tr>"
     ' "$data")"
+    local upd_html=""
+    # (patsub_replacement: a bare & in the replacement means "the match")
+    [[ -n "${UPDATE_NOTICE:-}" ]] && upd_html="<div class=\"upd\">${UPDATE_NOTICE//>/\&gt;}</div>"
     cat > "$out" <<HTML
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -430,6 +437,7 @@ th{cursor:pointer;user-select:none;font-size:12px;text-transform:uppercase;color
 .s-hi{background:#b91c1c}.s-md{background:#ea580c}.s-lo{background:#ca8a04}.s-0{background:#16a34a}.d{background:#dc2626}.dn{background:#6b7280}
 .btn{display:inline-block;padding:4px 10px;border-radius:6px;background:#2563eb;color:#fff;text-decoration:none;font-size:12px}
 footer{color:var(--mut);margin-top:12px;font-size:12px}
+.upd{margin-top:12px;padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;font-size:13px}
 </style></head><body>
 <h1>AbuseIPDB report &mdash; ${HOST_LABEL} ${suffix}</h1>
 <div class="sub">Generated ${now} &middot; threshold ${THRESHOLD}% &middot; window ${MAX_AGE_DAYS} days</div>
@@ -447,6 +455,7 @@ footer{color:var(--mut);margin-top:12px;font-size:12px}
 </tr></thead><tbody>
 ${rows}
 </tbody></table></div>
+${upd_html}
 <footer>${unch} unchanged dirty IP(s) were already known and not re-alerted. abuse-checker v${AC_VERSION}</footer>
 <script>
 (function(){var t=document.getElementById('t'),b=t.tBodies[0],q=document.getElementById('q');
@@ -492,6 +501,7 @@ plain_summary() {
         (.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED")) | item),
         "",
         "\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted."' "$data"
+    [[ -z "${UPDATE_NOTICE:-}" ]] || printf '\n%s\n' "$UPDATE_NOTICE"
 }
 
 # ---------------------------------------------------------------------------
@@ -890,6 +900,133 @@ cmd_uninstall() {
 }
 
 # ---------------------------------------------------------------------------
+# Self-update from GitHub
+# ---------------------------------------------------------------------------
+UPDATE_NOTICE=""
+
+repo_slug()   { printf '%s' "${REPO_SLUG:-$DEFAULT_REPO_SLUG}"; }
+repo_branch() { printf '%s' "${REPO_BRANCH:-$DEFAULT_REPO_BRANCH}"; }
+raw_url()     { printf '%s' "${ABUSE_CHECKER_GITHUB_RAW:-https://raw.githubusercontent.com/$(repo_slug)/$(repo_branch)}/abuse-checker.sh"; }
+archive_url() { printf '%s' "${ABUSE_CHECKER_GITHUB_ARCHIVE:-https://github.com/$(repo_slug)/archive/refs/heads/$(repo_branch).tar.gz}"; }
+
+# version_gt A B -> true when A is a newer version than B
+version_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+
+# Extract AC_VERSION from a script file.
+script_version() { sed -n 's/^readonly AC_VERSION="\([0-9][0-9A-Za-z.+-]*\)"$/\1/p' "$1" | head -n1; }
+
+# Fetch the remote version (prints it). Public URL, but still sent via stdin.
+fetch_remote_version() {
+    local out="$1/remote-abuse-checker.sh" code ver
+    code="$(secure_curl "$(cfg_line url "$(raw_url)")" --location --max-time 30 -o "$out" -w '%{http_code}')" || code="000"
+    # file:// mirrors report 000 on success.
+    [[ "$code" == "200" || ( "$code" == "000" && "$(raw_url)" == file://* && -s "$out" ) ]] \
+        || { warn "update check failed: HTTP $code from $(raw_url)"; return 1; }
+    ver="$(script_version "$out")"
+    [[ -n "$ver" ]] || { warn "update check: no AC_VERSION in remote script"; return 1; }
+    printf '%s' "$ver"
+}
+
+# Cached once-a-day check used by scheduled runs. Prints the latest version.
+cached_remote_version() {
+    local stamp="$STATE_DIR/update-check.json" now ver="" dir
+    now="$(date +%s)"
+    if [[ -r "$stamp" ]] && (( now - $(jq -r '.checkedAt // 0' "$stamp" 2>/dev/null || echo 0) < 86400 )); then
+        jq -r '.latest // empty' "$stamp" 2>/dev/null
+        return 0
+    fi
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-upd.XXXXXX")"
+    ver="$(fetch_remote_version "$dir")" || ver=""
+    rm -rf "$dir"
+    if [[ -n "$ver" && -w "$STATE_DIR" ]]; then
+        jq -n --argjson t "$now" --arg v "$ver" '{checkedAt:$t, latest:$v}' > "$stamp.tmp" && mv -f "$stamp.tmp" "$stamp"
+        if [[ $EUID -eq 0 ]] && id "$SERVICE_USER" >/dev/null 2>&1; then chown "$SERVICE_USER:$SERVICE_USER" "$stamp" 2>/dev/null || true; fi
+    fi
+    printf '%s' "$ver"
+}
+
+# AUTO_UPDATE=notify during --run: log + banner in report and alerts.
+update_notice_check() {
+    local latest
+    case "${AUTO_UPDATE:-notify}" in
+        false|no|off|0) return 0 ;;
+    esac
+    latest="$(cached_remote_version)" || return 0
+    if [[ -n "$latest" ]] && version_gt "$latest" "$AC_VERSION"; then
+        # shellcheck disable=SC2089,SC2090  # plain message text, not a command
+        UPDATE_NOTICE="Update available: v$latest -> Run 'sudo abuse-checker --update'"
+        # shellcheck disable=SC2090
+        export UPDATE_NOTICE
+        info "$UPDATE_NOTICE (installed v$AC_VERSION)"
+    fi
+    return 0
+}
+
+cmd_check_update() {
+    local dir latest
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-upd.XXXXXX")"
+    latest="$(fetch_remote_version "$dir")" || { rm -rf "$dir"; die "could not determine the latest version"; }
+    rm -rf "$dir"
+    echo "Installed : v$AC_VERSION"
+    echo "Latest    : v$latest ($(repo_slug)@$(repo_branch))"
+    if version_gt "$latest" "$AC_VERSION"; then
+        echo "Update available -> run: sudo abuse-checker --update"
+    else
+        echo "Up to date."
+    fi
+}
+
+# cmd_update [force]: download, verify everything, then run install.sh.
+cmd_update() {
+    local force="${1:-}" dir src f ver
+    if [[ $EUID -ne 0 && -z "${ABUSE_CHECKER_UPDATE_INSTALLER:-}" ]]; then
+        die "run as root: sudo abuse-checker --update"
+    fi
+    command -v tar >/dev/null 2>&1 || die "tar is required for updates"
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-upd.XXXXXX")"
+    chmod 0700 "$dir"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$dir'" EXIT
+    info "downloading $(archive_url)"
+    secure_curl "$(cfg_line url "$(archive_url)")" --fail --location --max-time 120 -o "$dir/src.tar.gz" \
+        || die "download failed"
+    tar -xzf "$dir/src.tar.gz" -C "$dir" 2>/dev/null || die "downloaded archive is not a valid tarball; nothing changed"
+    src="$(find "$dir" -mindepth 2 -maxdepth 2 -name abuse-checker.sh -printf '%h\n' | head -n1)"
+    [[ -n "$src" && -f "$src/install.sh" ]] || die "archive does not contain abuse-checker.sh/install.sh; nothing changed"
+    for f in "$src/abuse-checker.sh" "$src/install.sh" "$src"/connectors/*.sh; do
+        [[ -f "$f" ]] || continue
+        bash -n "$f" 2>/dev/null || die "downloaded $(basename "$f") fails 'bash -n'; update rejected, installed version untouched"
+    done
+    ver="$(script_version "$src/abuse-checker.sh")"
+    [[ -n "$ver" ]] || die "downloaded abuse-checker.sh has no AC_VERSION; update rejected"
+    if [[ "$force" != "force" ]] && ! version_gt "$ver" "$AC_VERSION"; then
+        info "already up to date (installed v$AC_VERSION, remote v$ver)"
+        return 0
+    fi
+    info "verified v$ver; installing (secrets, ips.txt and state are kept)"
+    if [[ -n "${ABUSE_CHECKER_UPDATE_INSTALLER:-}" ]]; then
+        "$ABUSE_CHECKER_UPDATE_INSTALLER" "$src" </dev/null || die "installer failed"
+    else
+        bash "$src/install.sh" --no-wizard </dev/null || die "install.sh failed"
+    fi
+    [[ -w "$STATE_DIR" ]] && rm -f "$STATE_DIR/update-check.json"
+    info "updated v$AC_VERSION -> v$ver"
+}
+
+# --auto-update: run as root by ExecStartPre=+ before each scheduled check.
+# Only acts when AUTO_UPDATE=true; never fails the service.
+cmd_auto_update() {
+    local latest
+    [[ "${AUTO_UPDATE:-notify}" == "true" ]] || return 0
+    latest="$(cached_remote_version)" || return 0
+    if [[ -n "$latest" ]] && version_gt "$latest" "$AC_VERSION"; then
+        info "AUTO_UPDATE=true: updating v$AC_VERSION -> v$latest"
+        ( cmd_update ) || warn "automatic update failed; continuing with v$AC_VERSION"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 setup_tmp() {
@@ -918,6 +1055,7 @@ cmd_run() {
         info "dry-run: using mock AbuseIPDB responses, state file $state_file"
     fi
     ensure_state "$state_file"
+    $DRY_RUN || update_notice_check
     results="$TMPD/results.jsonl"; classified="$TMPD/classified.json"; newstate="$TMPD/state.new"
     collect_results "$results"
     if [[ ! -s "$results" ]]; then
@@ -987,6 +1125,7 @@ cmd_status() {
     fi
     echo "Reports     : $(find "$REPORT_DIR" -maxdepth 1 -name 'report_*.html' 2>/dev/null | wc -l) file(s) in $REPORT_DIR"
     echo "API keys    : ${#API_KEYS[@]} configured"
+    echo "Updates     : AUTO_UPDATE=${AUTO_UPDATE:-notify} from $(repo_slug)@$(repo_branch)$( [[ -r "$STATE_DIR/update-check.json" ]] && jq -r '" (latest seen: v\(.latest))"' "$STATE_DIR/update-check.json" 2>/dev/null)"
     echo "Secrets     : $(current_store) store (new encryptions use: $(crypto_tier))"
     local c names=""
     while IFS= read -r c; do names+="$(basename "$c" .sh) "; done < <(valid_connectors 2>/dev/null)
@@ -1025,6 +1164,9 @@ Secrets & maintenance (root):
   --edit-secrets        Decrypt to RAM (/dev/shm), open \$EDITOR, validate, re-encrypt
   --encrypt-secrets     Migrate plain-text secrets.conf into the encrypted store
   --set-secret KEY      Set one variable; the value is read from stdin
+  --check-update        Compare the installed version with GitHub ($DEFAULT_REPO_SLUG)
+  --update, --self-update [--force]
+                        Download, verify (bash -n) and install the latest version
   --uninstall [--keep|--purge]
                         Remove the application (menu when interactive)
   -h, --help            Show this help
@@ -1050,6 +1192,10 @@ main() {
             --uninstall) MODE="uninstall" ;;
             --keep|--purge) extra="${arg#--}" ;;
             --refresh-unit) MODE="refresh-unit" ;;
+            --check-update) MODE="check-update" ;;
+            --update|--self-update) MODE="update" ;;
+            --force) extra="force" ;;
+            --auto-update) MODE="auto-update" ;;
             -h|--help) usage; exit 0 ;;
             -V|--version) echo "$AC_VERSION"; exit 0 ;;
             *) usage >&2; exit 2 ;;
@@ -1067,6 +1213,11 @@ main() {
     load_config
     install_redaction
     require_tools
+    case "$MODE" in
+        check-update) cmd_check_update; return ;;
+        update) cmd_update "$extra"; return ;;
+        auto-update) cmd_auto_update; return ;;
+    esac
     setup_tmp
     case "$MODE" in
         run) cmd_run ;;

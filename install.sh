@@ -1,10 +1,49 @@
 #!/usr/bin/env bash
 # Install or update abuse-checker. Safe to re-run: existing configuration,
 # IP list and state are never overwritten.
-#   sudo ./install.sh [--no-enable] [--non-interactive]
+#
+# Local mode (from a clone):
+#   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard]
+# One-line mode (downloads the repository tarball itself):
+#   curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+#   ... | sudo AC_BRANCH=<branch> bash        # install another branch
+#
+# The whole script is one { ... } block so bash parses it completely before
+# running anything; with `curl | bash` nothing can then read the rest of the
+# script from stdin by accident.
+{
 set -euo pipefail
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_SLUG="${AC_REPO:-egwyl666/abuseDB-checker}"
+REPO_BRANCH="${AC_BRANCH:-main}"
+ARCHIVE_URL="${ABUSE_CHECKER_GITHUB_ARCHIVE:-https://github.com/$REPO_SLUG/archive/refs/heads/$REPO_BRANCH.tar.gz}"
+CURL="${ABUSE_CHECKER_CURL:-curl}"
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)" || SRC="$(pwd)"
+
+# Bootstrap: no repository files next to us (piped from curl) -> download
+# the tarball, verify it and run its install.sh with the same arguments.
+if [[ ! -f "$SRC/abuse-checker.sh" || ! -d "$SRC/connectors" ]]; then
+    [[ -z "${AC_BOOTSTRAPPED:-}" ]] || { echo "error: downloaded archive is incomplete" >&2; exit 1; }
+    for t in curl tar; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
+    BOOT="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-install.XXXXXX")"
+    trap 'rm -rf "$BOOT"' EXIT
+    echo "==> downloading $REPO_SLUG@$REPO_BRANCH"
+    printf 'url = "%s"\n' "$ARCHIVE_URL" \
+        | "$CURL" --fail --silent --show-error --location --max-time 120 --config - -o "$BOOT/src.tar.gz" \
+        || { echo "error: download failed: $ARCHIVE_URL" >&2; exit 1; }
+    tar -xzf "$BOOT/src.tar.gz" -C "$BOOT" </dev/null || { echo "error: cannot extract archive" >&2; exit 1; }
+    BOOT_SRC="$(find "$BOOT" -mindepth 2 -maxdepth 2 -name install.sh -printf '%h\n' | head -n1)"
+    [[ -n "$BOOT_SRC" ]] || { echo "error: install.sh not found in archive" >&2; exit 1; }
+    for f in "$BOOT_SRC"/install.sh "$BOOT_SRC"/abuse-checker.sh "$BOOT_SRC"/connectors/*.sh; do
+        bash -n "$f" || { echo "error: syntax check failed for $(basename "$f"); aborting" >&2; exit 1; }
+    done
+    if [[ -n "${ABUSE_CHECKER_BOOTSTRAP_DRYRUN:-}" ]]; then
+        echo "==> bootstrap verified: $BOOT_SRC"; exit 0
+    fi
+    AC_BOOTSTRAPPED=1 bash "$BOOT_SRC/install.sh" "$@"
+    exit $?
+fi
 USER_NAME="abusechecker"
 BIN="/usr/local/bin/abuse-checker"
 CONF_DIR="/etc/abuse-checker"
@@ -18,8 +57,8 @@ INTERACTIVE=true
 for a in "$@"; do
     case "$a" in
         --no-enable) ENABLE=false ;;
-        --non-interactive|-n) INTERACTIVE=false ;;
-        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive]"; exit 0 ;;
+        --non-interactive|--no-wizard|-n) INTERACTIVE=false ;;
+        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard]"; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -118,7 +157,7 @@ if $UPDATE; then say "update complete ($("$BIN" --version))"; else say "install 
 # ask VAR "prompt" [silent]: read one answer; Enter = skip.
 ask() {
     local __v
-    if [[ "${3:-}" == "silent" ]]; then read -r -s -p "    $2: " __v; echo; else read -r -p "    $2: " __v; fi
+    if [[ "${3:-}" == "silent" ]]; then read -r -s -u "$TTY_FD" -p "    $2: " __v || __v=""; echo; else read -r -u "$TTY_FD" -p "    $2: " __v || __v=""; fi
     printf -v "$1" '%s' "$__v"
 }
 # put KEY VALUE: store via stdin so the value never shows up in `ps`.
@@ -132,7 +171,7 @@ wizard() {
     local reply v1 v2 v3 v4
     echo
     echo "Would you like to configure API keys and notification connectors now? [y/N]"
-    read -r -p "(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets') " reply || reply=""
+    read -r -u "$TTY_FD" -p "(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets') " reply || reply=""
     [[ "$reply" =~ ^[Yy] ]] || { echo "Skipped. Configure later with: sudo abuse-checker --edit-secrets"; return 0; }
     echo "Every step is optional: press Enter to skip it."
     echo
@@ -153,14 +192,27 @@ wizard() {
             ask v4 "SMTP password" silent; put SMTP_PASS "$v4"
         fi
     fi
+    echo "  Automatic updates from GitHub ($REPO_SLUG)"
+    read -r -u "$TTY_FD" -p "    Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled] " v1 || v1=""
+    case "$v1" in 2) v1=true ;; 3) v1=false ;; *) v1=notify ;; esac
+    put AUTO_UPDATE "$v1"
     echo
     echo "Configuration stored encrypted ($("$BIN" --status 2>/dev/null | sed -n 's/^Secrets *: //p'))."
-    read -r -p "Send a test notification now (abuse-checker --test-notify)? [y/N] " reply || reply=""
+    read -r -u "$TTY_FD" -p "Send a test notification now (abuse-checker --test-notify)? [y/N] " reply || reply=""
     if [[ "$reply" =~ ^[Yy] ]]; then "$BIN" --test-notify || echo "test notification reported errors (see above)"; fi
 }
 
-if $INTERACTIVE && [[ -t 0 && -t 1 ]]; then
-    wizard
+# Under `curl | sudo bash` stdin is the pipe, so answers are read from the
+# controlling terminal (/dev/tty) instead.
+TTY_FD=0
+if $INTERACTIVE && [[ -t 1 ]]; then
+    if [[ -t 0 ]]; then
+        wizard
+    elif { exec 3</dev/tty; } 2>/dev/null; then
+        TTY_FD=3
+        wizard
+        exec 3<&-
+    fi
 fi
 
 cat <<MSG
@@ -173,3 +225,5 @@ Next steps:
   sudo systemctl start abuse-checker.service && journalctl -u abuse-checker -n 50
   sudo abuse-checker --uninstall              # remove (menu)
 MSG
+exit 0
+}

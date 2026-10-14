@@ -11,6 +11,9 @@ Group=abusechecker
 # Secrets are provided by the generated drop-in
 # abuse-checker.service.d/10-secrets.conf (LoadCredentialEncrypted= for
 # systemd-creds, or LoadCredential= of the OpenSSL master key).
+# AUTO_UPDATE=true: "+" runs this step as root outside the sandbox so it can
+# replace the binary; "-" means a failed update never blocks the check.
+ExecStartPre=-+/usr/local/bin/abuse-checker --auto-update
 ExecStart=/usr/local/bin/abuse-checker --run
 TimeoutStartSec=30min
 Nice=10
