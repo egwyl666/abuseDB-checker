@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.4.0"
+readonly AC_VERSION="1.5.0"
 # Upstream repository used by --check-update / --update (override with
 # REPO_SLUG / REPO_BRANCH in the secrets store).
 readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"
@@ -25,6 +25,7 @@ TMPD=""
 RAM_FILES=()
 IP_ARGS=()
 IP_COMMENT=""
+UPGRADE_OS=false
 RAM_COPY=""
 MODE="run"
 DRY_RUN=false
@@ -139,11 +140,16 @@ load_config() {
 }
 
 require_tools() {
-    local t
-    for t in jq awk sed date mktemp; do
-        command -v "$t" >/dev/null 2>&1 || die "missing dependency: $t"
-    done
-    command -v "$CURL_BIN" >/dev/null 2>&1 || die "missing dependency: curl"
+    local -a miss=()
+    mapfile -t miss < <(for t in jq awk sed date mktemp flock; do have_tool "$t" || echo "$t"; done)
+    command -v "$CURL_BIN" >/dev/null 2>&1 || miss+=(curl)
+    (( ${#miss[@]} == 0 )) && return 0
+    # Root fallback: install what is missing instead of failing the run.
+    if [[ "${AUTO_INSTALL_DEPS:-true}" != "false" ]] && can_manage_packages && install_missing_deps >/dev/null; then
+        info "installed missing dependencies: ${miss[*]}"
+        return 0
+    fi
+    die "missing dependencies: ${miss[*]} (run: sudo abuse-checker --doctor)"
 }
 
 # ---------------------------------------------------------------------------
@@ -263,34 +269,84 @@ $(cfg_line header "Accept: application/json")"
     return 2
 }
 
+# Shared jq helpers (also used by the HTML report and the connectors).
+#   catname : AbuseIPDB category id -> name (https://www.abuseipdb.com/categories)
+#   catlist : "[SSH, Brute-Force]" for an entry, or ""
+#   why     : one-line reason, max 120 chars: latest report comment for an
+#             IP, or the worst sub-hosts for a CIDR
+# shellcheck disable=SC2016
+JQ_LIB='
+def catname: {"1":"DNS Compromise","2":"DNS Poisoning","3":"Fraud Orders","4":"DDoS Attack",
+    "5":"FTP Brute-Force","6":"Ping of Death","7":"Phishing","8":"Fraud VoIP","9":"Open Proxy",
+    "10":"Web Spam","11":"Email Spam","12":"Blog Spam","13":"VPN IP","14":"Port Scan",
+    "15":"Hacking","16":"SQL Injection","17":"Spoofing","18":"Brute-Force","19":"Bad Web Bot",
+    "20":"Exploited Host","21":"Web App Attack","22":"SSH","23":"IoT Targeted"}[tostring]
+    // "Category \(.)";
+def catlist: (.topCategories // []) | if length > 0 then "[" + join(", ") + "]" else "" end;
+def clip($n): if length > $n then .[:$n] + "…" else . end;
+def why: if .kind == "cidr" then
+        ((.hosts // [])[:3] | map("\(.ipAddress) (\(.abuseConfidenceScore // 0)%)")
+         | if length > 0 then "worst hosts: " + join(", ") else "" end)
+    else ((.reports // [])[0].comment // "") | gsub("[\\r\\n\\t]+"; " ") | gsub("^ +| +$"; "") | clip(120) end;
+'
+
 # Normalize an API response into one result object (jq programs, not shell).
 # shellcheck disable=SC2016
 norm_check='.data | {target:$t, kind:"ip", score:(.abuseConfidenceScore // 0),
     total:(.totalReports // 0), last:(.lastReportedAt // null), isp:(.isp // ""),
-    domain:(.domain // ""), country:(.countryCode // "")}'
+    domain:(.domain // ""), country:(.countryCode // ""),
+    usage:(.usageType // ""), hostnames:((.hostnames // []) | join(", ")),
+    distinctUsers:(.numDistinctUsers // 0),
+    reports:((.reports // []) | sort_by(.reportedAt // "") | reverse | .[:10]
+        | map({reportedAt, comment:((.comment // "") | .[:1000]),
+               categories:((.categories // []) | map(catname)),
+               reporterCountryCode:(.reporterCountryCode // "")})),
+    topCategories:([(.reports // [])[] | (.categories // [])[]]
+        | group_by(.) | map({c:.[0], n:length}) | sort_by(-.n, .c) | map(.c | catname))}'
 # shellcheck disable=SC2016
 norm_block='.data as $d | ($d.reportedAddress // []) as $r | {target:$t, kind:"cidr",
     score:([$r[].abuseConfidenceScore] | max // 0),
     total:([$r[].numReports] | add // 0),
     last:([$r[].mostRecentReport | select(. != null)] | max),
     isp:("Subnet: \($r | length) of \($d.numPossibleHosts // "?") hosts reported"),
-    domain:"", country:([$r[].countryCode | select(. != null)] | unique | join(","))}'
+    domain:"", country:([$r[].countryCode | select(. != null)] | unique | join(",")),
+    reportedHosts:($r | length),
+    hosts:($r | sort_by(-(.abuseConfidenceScore // 0), -(.numReports // 0)) | .[:25]
+        | map({ipAddress, numReports:(.numReports // 0), abuseConfidenceScore:(.abuseConfidenceScore // 0),
+               mostRecentReport, countryCode:(.countryCode // "")}))}'
 
-# Deterministic mock response used by --dry-run / --test-notify.
+# Deterministic mock response used by --dry-run / --test-notify. Dirty IPs
+# carry realistic verbose .reports[] (categories + log comments).
 mock_response() {
     local endpoint="$1" target="$2" h ts
     h=$(printf '%s' "$target" | cksum | awk '{print $1 % 4}')
     ts="2026-01-15T08:30:00+00:00"  # fixed so repeated dry-runs are stable
     if [[ "$endpoint" == "check" ]]; then
-        case "$h" in
-            0) jq -n --arg ip "$target" '{data:{ipAddress:$ip,abuseConfidenceScore:0,totalReports:0,lastReportedAt:null,isp:"Example Clean ISP",domain:"clean.example",countryCode:"DE"}}' ;;
-            1) jq -n --arg ip "$target" --arg ts "$ts" '{data:{ipAddress:$ip,abuseConfidenceScore:12,totalReports:2,lastReportedAt:$ts,isp:"Mock Hosting LLC",domain:"mock.example",countryCode:"NL"}}' ;;
-            2) jq -n --arg ip "$target" --arg ts "$ts" '{data:{ipAddress:$ip,abuseConfidenceScore:87,totalReports:41,lastReportedAt:$ts,isp:"Bad Actor Networks",domain:"bad.example",countryCode:"US"}}' ;;
-            *) jq -n --arg ip "$target" --arg ts "$ts" '{data:{ipAddress:$ip,abuseConfidenceScore:45,totalReports:7,lastReportedAt:$ts,isp:"Shared VPS Ltd",domain:"vps.example",countryCode:"FR"}}' ;;
-        esac
+        jq -n --arg ip "$target" --arg ts "$ts" --argjson h "$h" '
+            [ {s:0,  n:0,  isp:"Example Clean ISP",  dom:"clean.example", cc:"DE", u:"Data Center/Web Hosting/Transit", r:[]},
+              {s:12, n:2,  isp:"Mock Hosting LLC",   dom:"mock.example",  cc:"NL", u:"Data Center/Web Hosting/Transit",
+               r:[{c:[14],     m:"Port scan: 1,024 TCP SYN probes in 60s (ports 22,23,80,443,3389)", cc:"US"}]},
+              {s:87, n:41, isp:"Bad Actor Networks", dom:"bad.example",   cc:"US", u:"Data Center/Web Hosting/Transit",
+               r:[{c:[18,22],  m:"SSH brute-force login attempt from user root", cc:"DE"},
+                  {c:[18,22],  m:"Failed password for invalid user admin from 192.0.2.12 port 51234 ssh2", cc:"FR"},
+                  {c:[21,15],  m:"GET /wp-login.php?action=register - WordPress login abuse", cc:"GB"}]},
+              {s:45, n:7,  isp:"Shared VPS Ltd",     dom:"vps.example",   cc:"FR", u:"Commercial",
+               r:[{c:[11,10],  m:"Spam relay: 312 messages rejected by RBL", cc:"CA"},
+                  {c:[19],     m:"Aggressive crawler ignoring robots.txt", cc:"US"}]} ][$h] as $m
+            | {data:{ipAddress:$ip, abuseConfidenceScore:$m.s, totalReports:$m.n,
+                     lastReportedAt:(if $m.n > 0 then $ts else null end),
+                     isp:$m.isp, domain:$m.dom, countryCode:$m.cc, usageType:$m.u,
+                     hostnames:(if $m.n > 0 then ["host-\($ip | gsub("[.:]"; "-")).\($m.dom)"] else [] end),
+                     numDistinctUsers:($m.r | length),
+                     reports:[$m.r | to_entries[] | {reportedAt:"2026-01-1\(5 - .key)T0\(8 - .key):30:00+00:00",
+                         comment:.value.m, categories:.value.c, reporterId:(1000 + .key),
+                         reporterCountryCode:.value.cc, reporterCountryName:""}]}}'
     else
         jq -n --arg n "$target" --arg ts "$ts" '{data:{networkAddress:($n|split("/")[0]),numPossibleHosts:256,
-            reportedAddress:[{ipAddress:"198.51.100.7",numReports:3,mostRecentReport:$ts,abuseConfidenceScore:33,countryCode:"GB"}]}}'
+            reportedAddress:[
+              {ipAddress:"198.51.100.7",  numReports:3,  mostRecentReport:$ts, abuseConfidenceScore:33, countryCode:"GB"},
+              {ipAddress:"198.51.100.42", numReports:19, mostRecentReport:$ts, abuseConfidenceScore:76, countryCode:"GB"},
+              {ipAddress:"198.51.100.99", numReports:1,  mostRecentReport:$ts, abuseConfidenceScore:4,  countryCode:"GB"}]}}'
     fi
 }
 
@@ -311,7 +367,7 @@ check_target() {
         api_get "$endpoint" "$query" "$body" || rc=$?
     fi
     if (( rc == 0 )) && jq -e '.data' "$body" >/dev/null 2>&1; then
-        jq -c --arg t "$target" "$filter" "$body" >> "$results"
+        jq -c --arg t "$target" "$JQ_LIB $filter" "$body" >> "$results"
     else
         local msg="request failed"
         (( rc == 2 )) && msg="all API keys exhausted"
@@ -418,20 +474,52 @@ render_report() {
         (map(select(.status=="UNCHANGED"))|length), (map(select(.status=="ERROR"))|length)] | @tsv' "$data")"
     local total clean new esc unch err
     IFS=$'\t' read -r total clean new esc unch err <<< "$stats"
-    rows="$(jq -r '
+    rows="$(jq -r "$JQ_LIB"'
         def order: {"NEW":0,"ESCALATED":1,"UNCHANGED":2,"ERROR":3,"CLEAN":4}[.status];
         def sc: if .score >= 75 then "s-hi" elif .score >= 25 then "s-md" elif .score > 0 then "s-lo" else "s-0" end;
+        def hsc: if . >= 75 then "s-hi" elif . >= 25 then "s-md" elif . > 0 then "s-lo" else "s-0" end;
+        def ts: (. // "-") | sub("T"; " ") | sub("(\\+00:00|Z)$"; "") | @html;
+        def cbadges: map("<span class=\"cat\">\(@html)</span>") | join(" ");
+        def ipdetail:
+            "<div class=\"meta\"><span><b>Usage type:</b> \((.usage // "") | if . == "" then "-" else @html end)</span>"
+            + "<span><b>Hostnames:</b> \((.hostnames // "") | if . == "" then "-" else @html end)</span>"
+            + "<span><b>Distinct reporters:</b> \(.distinctUsers // 0)</span></div>"
+            + "<table class=\"sub\"><thead><tr><th>Timestamp (UTC)</th><th>Categories</th><th>Reporter</th><th>Comment / log snippet</th></tr></thead><tbody>"
+            + ([.reports[] | "<tr><td class=\"m nw\">\(.reportedAt | ts)</td><td>\(.categories | cbadges)</td>"
+                + "<td>\((.reporterCountryCode // "") | if . == "" then "-" else @html end)</td>"
+                + "<td><pre>\((.comment // "") | if . == "" then "(no comment)" else @html end)</pre></td></tr>"] | join(""))
+            + "</tbody></table>";
+        def cidrdetail:
+            "<div class=\"meta\"><span><b>Reported hosts in block:</b> \(.reportedHosts // (.hosts | length))</span>"
+            + (if (.reportedHosts // 0) > (.hosts | length) then "<span>(showing the top \(.hosts | length) by score)</span>" else "" end) + "</div>"
+            + "<table class=\"sub\"><thead><tr><th>IP</th><th>Score</th><th>Reports</th><th>Last reported (UTC)</th><th>Country</th><th></th></tr></thead><tbody>"
+            + ([.hosts[] | "<tr><td class=\"m\">\(.ipAddress | @html)</td>"
+                + "<td><span class=\"sc \(.abuseConfidenceScore | hsc)\">\(.abuseConfidenceScore)%</span></td>"
+                + "<td>\(.numReports)</td><td class=\"m nw\">\(.mostRecentReport | ts)</td>"
+                + "<td>\((.countryCode // "") | @html)</td>"
+                + "<td><a class=\"btn\" target=\"_blank\" rel=\"noopener\" href=\"https://www.abuseipdb.com/check/\(.ipAddress | @uri)\">AbuseIPDB</a></td></tr>"] | join(""))
+            + "</tbody></table>";
         sort_by(order, -.score)[] |
-        "<tr data-s=\"\(order)\"><td><span class=\"b b-\(.status|ascii_downcase)\">\(.status)</span></td>"
+        (if .status == "CLEAN" or .status == "ERROR" then 0
+         elif .kind == "cidr" then ((.hosts // []) | length) else ((.reports // []) | length) end) as $nd
+        | "<tr class=\"r\" data-s=\"\(order)\"><td><span class=\"b b-\(.status|ascii_downcase)\">\(.status)</span></td>"
         + "<td class=\"m\">\(.target|@html)</td>"
         + "<td data-v=\"\(.score)\"><span class=\"sc \(sc)\">\(.score)%</span></td>"
         + "<td data-v=\"\(.total)\">\(.total)"
         + (if .delta > 0 then " <span class=\"d\">+\(.delta)</span>" elif .delta < 0 then " <span class=\"dn\">\(.delta)</span>" else "" end) + "</td>"
+        + "<td>\((.topCategories // [])[:3] | cbadges)\(if ((.topCategories // []) | length) > 3 then " <small>+\((.topCategories | length) - 3)</small>" else "" end)</td>"
+        + "<td data-v=\"\(if .kind == "cidr" then (.reportedHosts // 0) else (.distinctUsers // 0) end)\">"
+        + (if .kind == "cidr" then "\(.reportedHosts // 0) <small>hosts</small>" elif (.distinctUsers // 0) > 0 then "\(.distinctUsers)" else "-" end) + "</td>"
         + "<td>\((.isp // "") | @html)" + (if (.domain // "") != "" then "<br><small>\(.domain|@html)</small>" else "" end)
         + (if .error then "<br><small class=\"err\">\(.error|@html)</small>" else "" end) + "</td>"
         + "<td>\((.country // "") | @html)</td>"
         + "<td data-v=\"\(.last // "")\">\((.last // "-") | sub("T"; " ") | sub("\\+00:00$"; " UTC") | @html)</td>"
         + "<td><a class=\"btn\" target=\"_blank\" rel=\"noopener\" href=\"https://www.abuseipdb.com/check/\(.target|@uri)\">AbuseIPDB</a></td></tr>"
+        + (if $nd > 0 then
+            "<tr class=\"dr\"><td colspan=\"10\"><details><summary>"
+            + (if .kind == "cidr" then "View \($nd) reported host(s)" else "View \($nd) report detail(s)" end)
+            + "</summary>" + (if .kind == "cidr" then cidrdetail else ipdetail end) + "</details></td></tr>"
+           else "" end)
     ' "$data")"
     local upd_html=""
     # (patsub_replacement: a bare & in the replacement means "the match")
@@ -459,6 +547,13 @@ th{cursor:pointer;user-select:none;font-size:12px;text-transform:uppercase;color
 .s-hi{background:#b91c1c}.s-md{background:#ea580c}.s-lo{background:#ca8a04}.s-0{background:#16a34a}.d{background:#dc2626}.dn{background:#6b7280}
 .btn{display:inline-block;padding:4px 10px;border-radius:6px;background:#2563eb;color:#fff;text-decoration:none;font-size:12px}
 footer{color:var(--mut);margin-top:12px;font-size:12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.bar input{margin:0;flex:1}
+#xa{padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer}
+.cat{display:inline-block;padding:1px 6px;margin:1px 0;border-radius:4px;font-size:11px;background:#e0e7ff;color:#3730a3;white-space:nowrap}
+tr.dr>td{padding:0 10px 8px;border-bottom:1px solid var(--line)}details summary{cursor:pointer;color:#2563eb;font-size:12px;padding:4px 0}
+.meta{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:6px 0}
+table.sub{min-width:0;font-size:12px;background:var(--bg);border-radius:6px}table.sub th{cursor:default}table.sub th:after{content:""}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace}.nw{white-space:nowrap}
 .upd{margin-top:12px;padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;font-size:13px}
 </style></head><body>
 <h1>AbuseIPDB report &mdash; ${HOST_LABEL} ${suffix}</h1>
@@ -471,20 +566,22 @@ footer{color:var(--mut);margin-top:12px;font-size:12px}
 <div class="c unch"><b>${unch}</b><span>Unchanged dirty</span></div>
 <div class="c"><b>${err}</b><span>Errors</span></div>
 </div>
-<input id="q" type="search" placeholder="Filter by IP, ISP, country, status...">
+<div class="bar"><input id="q" type="search" placeholder="Filter by IP, ISP, category, comment..."><button id="xa" type="button">Expand all</button></div>
 <div class="wrap"><table id="t"><thead><tr>
-<th>Status</th><th>IP / Subnet</th><th>Abuse score</th><th>Reports (+delta)</th><th>ISP / Domain</th><th>Country</th><th>Last reported</th><th>Link</th>
+<th>Status</th><th>IP / Subnet</th><th>Abuse score</th><th>Reports (+delta)</th><th>Top categories</th><th>Distinct reporters</th><th>ISP / Domain</th><th>Country</th><th>Last reported</th><th>Link</th>
 </tr></thead><tbody>
 ${rows}
 </tbody></table></div>
 ${upd_html}
 <footer>${unch} unchanged dirty IP(s) were already known and not re-alerted. abuse-checker v${AC_VERSION}</footer>
 <script>
-(function(){var t=document.getElementById('t'),b=t.tBodies[0],q=document.getElementById('q');
-q.oninput=function(){var v=q.value.toLowerCase();[].forEach.call(b.rows,function(r){r.style.display=r.textContent.toLowerCase().indexOf(v)>-1?'':'none'})};
-[].forEach.call(t.tHead.rows[0].cells,function(h,i){var asc=true;h.onclick=function(){var rs=[].slice.call(b.rows);
+(function(){var t=document.getElementById('t'),b=t.tBodies[0],q=document.getElementById('q'),xa=document.getElementById('xa');
+var rows=[].slice.call(b.querySelectorAll('tr.r'));rows.forEach(function(r){var n=r.nextElementSibling;r._d=(n&&n.className==='dr')?n:null});
+q.oninput=function(){var v=q.value.toLowerCase();rows.forEach(function(r){var s=(r.textContent+(r._d?r._d.textContent:'')).toLowerCase().indexOf(v)>-1?'':'none';r.style.display=s;if(r._d)r._d.style.display=s})};
+var open=false;xa.onclick=function(){open=!open;[].forEach.call(b.querySelectorAll('details'),function(d){d.open=open});xa.textContent=open?'Collapse all':'Expand all'};
+[].forEach.call(t.tHead.rows[0].cells,function(h,i){var asc=true;h.onclick=function(){
 function k(r){var c=r.cells[i];if(i===0)return +r.getAttribute('data-s');var v=c.getAttribute('data-v');if(v!==null){return isNaN(v)||v===''?v:+v}return c.textContent.toLowerCase()}
-rs.sort(function(x,y){var a=k(x),c=k(y);return (a>c?1:a<c?-1:0)*(asc?1:-1)});asc=!asc;rs.forEach(function(r){b.appendChild(r)})}})})();
+rows.sort(function(x,y){var a=k(x),c=k(y);return (a>c?1:a<c?-1:0)*(asc?1:-1)});asc=!asc;rows.forEach(function(r){b.appendChild(r);if(r._d)b.appendChild(r._d)})}})})();
 </script></body></html>
 HTML
     chmod 0640 "$out"
@@ -515,8 +612,10 @@ summary_counts() {
 
 plain_summary() {
     local data="$1" title="$2"
-    jq -r --arg title "$title" --argjson force "$FORCE_FULL" '
-        def item: "  [\(.status)] \(.target)  score \(.score)%  reports \(.total)" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "  \(.isp)" else "" end);
+    jq -r --arg title "$title" --argjson force "$FORCE_FULL" "$JQ_LIB"'
+        def item: "  [\(.status)] \(.target)  score \(.score)%  reports \(.total)" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "  \(.isp)" else "" end)
+            + (if catlist != "" then "\n      Categories: \(catlist)" else "" end)
+            + (if why != "" then "\n      Why: \(why)" else "" end);
         "\($title)",
         "Checked: \(length) | Clean: \(map(select(.status=="CLEAN"))|length) | New: \(map(select(.status=="NEW"))|length) | Escalated: \(map(select(.status=="ESCALATED"))|length) | Errors: \(map(select(.status=="ERROR"))|length)",
         "",
@@ -1041,6 +1140,8 @@ cmd_update() {
 # Only acts when AUTO_UPDATE=true; never fails the service.
 cmd_auto_update() {
     local latest
+    # Runs as root (ExecStartPre=+): repair missing dependencies first.
+    if [[ -n "$(missing_tools)" ]]; then install_missing_deps >/dev/null || warn "could not install missing dependencies"; fi
     [[ "${AUTO_UPDATE:-notify}" == "true" ]] || return 0
     latest="$(cached_remote_version)" || return 0
     if [[ -n "$latest" ]] && version_gt "$latest" "$AC_VERSION"; then
@@ -1421,6 +1522,238 @@ cmd_watchdog_recover() {
 }
 
 # ---------------------------------------------------------------------------
+# System dependencies, OS upgrade and --doctor
+# ---------------------------------------------------------------------------
+# Tools the program needs. ca-certificates is checked as a CA bundle file.
+REQUIRED_TOOLS=(bash curl jq awk sed openssl flock mktemp date base64 find tar ca-certificates)
+
+pkg_manager() {
+    local pm
+    if [[ -n "${ABUSE_CHECKER_PKG_MGR:-}" ]]; then printf '%s' "$ABUSE_CHECKER_PKG_MGR"; return 0; fi
+    for pm in apt-get dnf yum apk pacman zypper; do
+        command -v "$pm" >/dev/null 2>&1 && { printf '%s' "$pm"; return 0; }
+    done
+    return 1
+}
+
+# Package that provides a tool, per package manager.
+tool_pkg() {
+    local pm="$1" t="$2"
+    case "$t" in
+        awk) echo gawk ;;
+        flock) if [[ "$pm" == "apk" ]]; then echo flock; else echo util-linux; fi ;;
+        mktemp|date|base64) echo coreutils ;;
+        find) echo findutils ;;
+        *) echo "$t" ;;
+    esac
+}
+
+have_ca_bundle() {
+    local f
+    for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /etc/ssl/ca-bundle.pem; do
+        [[ -s "$f" ]] && return 0
+    done
+    return 1
+}
+
+# have_tool NAME (ABUSE_CHECKER_FAKE_MISSING_FILE lets tests simulate gaps)
+have_tool() {
+    if [[ -n "${ABUSE_CHECKER_FAKE_MISSING_FILE:-}" && -f "$ABUSE_CHECKER_FAKE_MISSING_FILE" ]] \
+       && grep -qx -- "$1" "$ABUSE_CHECKER_FAKE_MISSING_FILE"; then
+        return 1
+    fi
+    if [[ "$1" == "ca-certificates" ]]; then have_ca_bundle; else command -v "$1" >/dev/null 2>&1; fi
+}
+
+missing_tools() { local t; for t in "${REQUIRED_TOOLS[@]}"; do have_tool "$t" || echo "$t"; done; return 0; }
+
+can_manage_packages() { [[ $EUID -eq 0 || -n "${ABUSE_CHECKER_PKG_CMD:-}" ]]; }
+
+# pkg_run refresh|install PKG...|upgrade  (non-interactive, quiet)
+pkg_run() {
+    local action="$1"; shift
+    local pm bin
+    pm="$(pkg_manager)" || { warn "no supported package manager (apt-get, dnf, yum, apk, pacman, zypper)"; return 1; }
+    bin="${ABUSE_CHECKER_PKG_CMD:-$pm}"
+    case "$pm:$action" in
+        apt-get:refresh) "$bin" update -qq ;;
+        apt-get:install) env DEBIAN_FRONTEND=noninteractive "$bin" install -y -qq --no-install-recommends "$@" ;;
+        apt-get:upgrade) env DEBIAN_FRONTEND=noninteractive "$bin" -y -qq \
+                             -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade ;;
+        dnf:refresh|yum:refresh) "$bin" -q -y makecache ;;
+        dnf:install|yum:install) "$bin" -q -y install "$@" ;;
+        dnf:upgrade|yum:upgrade) "$bin" -q -y upgrade ;;
+        apk:refresh) "$bin" -q update ;;
+        apk:install) "$bin" -q add --no-cache "$@" ;;
+        apk:upgrade) "$bin" -q upgrade --no-cache ;;
+        pacman:refresh) "$bin" -Sy --noconfirm ;;
+        pacman:install) "$bin" -S --needed --noconfirm "$@" ;;
+        pacman:upgrade) "$bin" -Syu --noconfirm ;;
+        zypper:refresh) "$bin" --non-interactive --quiet refresh ;;
+        zypper:install) "$bin" --non-interactive --quiet install --no-recommends "$@" ;;
+        zypper:upgrade) "$bin" --non-interactive --quiet update ;;
+        *) warn "unsupported package manager action: $pm $action"; return 1 ;;
+    esac
+}
+
+os_upgrade() {
+    can_manage_packages || { warn "OS upgrade needs root"; return 1; }
+    info "upgrading system packages with $(pkg_manager || echo '?') (non-interactive)"
+    pkg_run refresh >&2 && pkg_run upgrade >&2
+}
+
+# Install whatever is missing. Prints the tools that were installed.
+install_missing_deps() {
+    local -a miss=() pkgs=()
+    local pm t
+    mapfile -t miss < <(missing_tools)
+    (( ${#miss[@]} == 0 )) && return 0
+    can_manage_packages || { warn "missing: ${miss[*]} (run as root to install them)"; return 1; }
+    pm="$(pkg_manager)" || { warn "missing: ${miss[*]}; no supported package manager found"; return 1; }
+    for t in "${miss[@]}"; do pkgs+=("$(tool_pkg "$pm" "$t")"); done
+    mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | awk '!seen[$0]++')
+    info "installing missing dependencies with $pm: ${pkgs[*]}"
+    # Package-manager output goes to stderr: stdout carries only the result list.
+    pkg_run refresh >&2 || warn "package metadata refresh failed; trying to install anyway"
+    pkg_run install "${pkgs[@]}" >&2 || { warn "package installation failed"; return 1; }
+    local -a still=()
+    mapfile -t still < <(missing_tools)
+    (( ${#still[@]} == 0 )) || { warn "still missing after install: ${still[*]}"; return 1; }
+    printf '%s\n' "${miss[@]}"
+}
+
+# --install-deps [--upgrade-os]: used by install.sh before anything else.
+cmd_install_deps() {
+    local upgrade="$1" got
+    if $upgrade; then os_upgrade || warn "OS upgrade failed; continuing"; fi
+    if got="$(install_missing_deps)"; then
+        [[ -n "$got" ]] && echo "installed: $(paste -sd' ' - <<< "$got")"
+        echo "all dependencies present"
+        return 0
+    fi
+    echo "error: missing dependencies: $(missing_tools | paste -sd' ' -)" >&2
+    return 1
+}
+
+DOC_OK=0 DOC_WARN=0 DOC_FIXED=0
+dok()  { DOC_OK=$((DOC_OK + 1));       printf '[OK]    %s\n' "$*"; }
+dwarn(){ DOC_WARN=$((DOC_WARN + 1));   printf '[WARN]  %s\n' "$*"; }
+dfix() { DOC_FIXED=$((DOC_FIXED + 1)); printf '[FIXED] %s\n' "$*"; }
+
+# doctor_perm PATH MODE OWNER:GROUP [label]  (fixes as root)
+doctor_perm() {
+    local path="$1" mode="$2" owner="$3" label="${4:-$1}" cur_mode cur_owner
+    [[ -e "$path" ]] || return 0
+    if [[ "$owner" == *"$SERVICE_USER"* ]] && ! id "$SERVICE_USER" >/dev/null 2>&1; then owner=""; fi
+    cur_mode="$(stat -c %a "$path")"; cur_owner="$(stat -c %U:%G "$path")"
+    if [[ "$cur_mode" == "$mode" && ( -z "$owner" || "$cur_owner" == "$owner" ) ]]; then
+        dok "$label ($cur_mode ${cur_owner})"
+    elif [[ $EUID -eq 0 ]]; then
+        chmod "$mode" "$path"; [[ -z "$owner" ]] || chown "$owner" "$path"
+        dfix "$label: $cur_mode $cur_owner -> $mode ${owner:-$cur_owner}"
+    else
+        dwarn "$label is $cur_mode $cur_owner, expected $mode ${owner:-}"
+    fi
+}
+
+cmd_doctor() {
+    local upgrade="$1" pm t got ver free_mb code min_mb="${DOCTOR_MIN_FREE_MB:-100}"
+    echo "abuse-checker v$AC_VERSION system check"
+    echo
+    # OS
+    if [[ -r "${ABUSE_CHECKER_OS_RELEASE:-/etc/os-release}" ]]; then
+        # shellcheck source=/dev/null
+        dok "OS: $( . "${ABUSE_CHECKER_OS_RELEASE:-/etc/os-release}"; echo "${PRETTY_NAME:-$ID}" ) (kernel $(uname -r))"
+    else
+        dwarn "OS: /etc/os-release not found"
+    fi
+    if pm="$(pkg_manager)"; then dok "package manager: $pm"; else dwarn "no supported package manager found"; fi
+    if $upgrade; then
+        if os_upgrade >/dev/null 2>&1; then dfix "system packages upgraded"; else dwarn "OS upgrade failed or not permitted"; fi
+    fi
+    # Dependencies
+    local -a miss=()
+    mapfile -t miss < <(missing_tools)
+    if (( ${#miss[@]} == 0 )); then
+        dok "dependencies: ${REQUIRED_TOOLS[*]}"
+    elif got="$(install_missing_deps 2>/dev/null)"; then
+        for t in $got; do dfix "installed missing dependency: $t"; done
+    else
+        for t in $(missing_tools); do dwarn "missing dependency: $t$(can_manage_packages || echo ' (run as root to install)')"; done
+    fi
+    # Versions
+    if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+        dok "bash $BASH_VERSION (>= 4.4)"
+    else
+        dwarn "bash $BASH_VERSION is older than 4.4"
+    fi
+    have_tool curl && dok "curl $(curl --version 2>/dev/null | awk 'NR==1{print $2}')"
+    have_tool jq && dok "jq $(jq --version 2>/dev/null | sed 's/^jq-//')"
+    have_tool openssl && dok "openssl $(openssl version 2>/dev/null | awk '{print $2}')"
+    # Service user and files
+    if id "$SERVICE_USER" >/dev/null 2>&1; then dok "service user $SERVICE_USER exists"
+    else dwarn "service user $SERVICE_USER missing (run install.sh)"; fi
+    if [[ -d "$CONF_DIR" ]]; then
+        doctor_perm "$CONF_DIR" 755 root:root
+        doctor_perm "$IPS_FILE" 644 "root:$SERVICE_USER"
+        doctor_perm "$ENC_FILE" 640 "root:$SERVICE_USER"
+        doctor_perm "$MASTER_KEY" 400 root:root
+        doctor_perm "$CRED_FILE" 600 root:root
+        doctor_perm "$SECRETS_FILE" 600 root:root
+        [[ -f "$SECRETS_FILE" ]] && dwarn "secrets stored in plain text; run: sudo abuse-checker --encrypt-secrets"
+        [[ -e "$IPS_FILE" ]] || dwarn "$IPS_FILE missing"
+    else
+        dwarn "$CONF_DIR missing (run install.sh)"
+    fi
+    if [[ -d "$STATE_DIR" ]]; then
+        doctor_perm "$STATE_DIR" 750 "$SERVICE_USER:$SERVICE_USER"
+        doctor_perm "$STATE_DIR/reports" 750 "$SERVICE_USER:$SERVICE_USER"
+        doctor_perm "$STATE_FILE" 640 "$SERVICE_USER:$SERVICE_USER"
+        free_mb="$(df -Pk "$STATE_DIR" 2>/dev/null | awk 'NR==2{print int($4/1024)}')"
+        if [[ -n "$free_mb" ]]; then
+            if (( free_mb >= min_mb )); then dok "free disk space in $STATE_DIR: ${free_mb} MB"
+            else dwarn "low disk space in $STATE_DIR: ${free_mb} MB (< ${min_mb} MB)"; fi
+        fi
+    else
+        dwarn "$STATE_DIR missing (run install.sh)"
+    fi
+    # systemd
+    if systemd_running; then
+        local u
+        for u in abuse-checker.timer abuse-checker-watchdog.timer; do
+            if "$SYSTEMCTL_BIN" is-enabled --quiet "$u" 2>/dev/null && "$SYSTEMCTL_BIN" is-active --quiet "$u" 2>/dev/null; then
+                dok "$u enabled and active"
+            elif [[ $EUID -eq 0 ]] && "$SYSTEMCTL_BIN" enable --now "$u" >/dev/null 2>&1; then
+                dfix "$u enabled and started"
+            else
+                dwarn "$u is not enabled/active"
+            fi
+        done
+        if "$SYSTEMCTL_BIN" is-failed --quiet abuse-checker.service 2>/dev/null; then
+            if [[ $EUID -eq 0 ]] && "$SYSTEMCTL_BIN" reset-failed abuse-checker.service 2>/dev/null; then
+                dfix "abuse-checker.service was failed; state reset (see journalctl -u abuse-checker)"
+            else
+                dwarn "abuse-checker.service is in the failed state"
+            fi
+        else
+            dok "abuse-checker.service not failed"
+        fi
+    else
+        dwarn "systemd not running: timer/service checks skipped"
+    fi
+    # Connectivity (no API key needed: any HTTP answer proves reachability)
+    if have_tool curl; then
+        code="$(secure_curl "$(cfg_line url "${ABUSE_CHECKER_DOCTOR_URL:-https://api.abuseipdb.com/api/v2/check}")" \
+                --max-time 15 -o /dev/null -w '%{http_code}' 2>/dev/null)" || code="000"
+        if [[ "$code" != "000" ]]; then dok "HTTPS to api.abuseipdb.com reachable (HTTP $code)"
+        else dwarn "cannot reach https://api.abuseipdb.com (DNS, firewall or proxy?)"; fi
+    fi
+    echo
+    echo "Summary: $DOC_OK OK, $DOC_FIXED fixed, $DOC_WARN warning(s)"
+    (( DOC_WARN == 0 ))
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 setup_tmp() {
@@ -1570,6 +1903,9 @@ Scheduling & recovery (root):
   --schedule SPEC       "06:00,18:00" | hourly | 6h | "every 12h" | daily |
                         raw OnCalendar | show | reset
   --watchdog-recover    Repair failed service/stale lock/inactive timer and alert
+  --doctor, --check-system [--upgrade-os]
+                        System checklist: OS, dependencies (auto-installed),
+                        versions, permissions, systemd, disk, connectivity
 
   --check-update        Compare the installed version with GitHub ($DEFAULT_REPO_SLUG)
   --update, --self-update [--force]
@@ -1612,6 +1948,9 @@ main() {
             --edit-ips) MODE="edit-ips" ;;
             --schedule) MODE="schedule"; extra="${1:-show}"; (( $# )) && shift ;;
             --watchdog-recover) MODE="watchdog" ;;
+            --doctor|--check-system) MODE="doctor" ;;
+            --install-deps) MODE="install-deps" ;;
+            --upgrade-os) UPGRADE_OS=true ;;
             -h|--help) usage; exit 0 ;;
             -V|--version) echo "$AC_VERSION"; exit 0 ;;
             *) usage >&2; exit 2 ;;
@@ -1630,6 +1969,8 @@ main() {
         del-ip) cmd_del_ip "${IP_ARGS[@]}"; return ;;
         edit-ips) cmd_edit_ips; return ;;
         schedule) cmd_schedule "$extra"; return ;;
+        doctor) cmd_doctor "$UPGRADE_OS"; return ;;
+        install-deps) cmd_install_deps "$UPGRADE_OS"; return ;;
     esac
     load_config
     install_redaction

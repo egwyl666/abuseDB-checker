@@ -3,7 +3,7 @@
 # IP list and state are never overwritten.
 #
 # Local mode (from a clone):
-#   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard]
+#   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]
 # One-line mode (downloads the repository tarball itself):
 #   curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
 #   ... | sudo AC_BRANCH=<branch> bash        # install another branch
@@ -25,7 +25,18 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)" || SRC="$(pwd
 # the tarball, verify it and run its install.sh with the same arguments.
 if [[ ! -f "$SRC/abuse-checker.sh" || ! -d "$SRC/connectors" ]]; then
     [[ -z "${AC_BOOTSTRAPPED:-}" ]] || { echo "error: downloaded archive is incomplete" >&2; exit 1; }
-    for t in curl tar; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
+    # tar/gzip are needed to unpack the archive; install them if absent.
+    if ! command -v tar >/dev/null 2>&1 || ! command -v gzip >/dev/null 2>&1; then
+        echo "==> installing tar/gzip"
+        if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tar gzip
+        elif command -v dnf >/dev/null; then dnf -q -y install tar gzip
+        elif command -v yum >/dev/null; then yum -q -y install tar gzip
+        elif command -v apk >/dev/null; then apk -q add --no-cache tar gzip
+        elif command -v pacman >/dev/null; then pacman -Sy --needed --noconfirm tar gzip
+        elif command -v zypper >/dev/null; then zypper --non-interactive --quiet install tar gzip
+        fi </dev/null || true
+    fi
+    for t in curl tar gzip; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
     BOOT="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-install.XXXXXX")"
     trap 'rm -rf "$BOOT"' EXIT
     echo "==> downloading $REPO_SLUG@$REPO_BRANCH"
@@ -53,12 +64,14 @@ DOC_DIR="/usr/local/share/doc/abuse-checker"
 LIB_DIR="/usr/local/lib/abuse-checker"
 ENABLE=true
 INTERACTIVE=true
+UPGRADE_OS=false
 
 for a in "$@"; do
     case "$a" in
         --no-enable) ENABLE=false ;;
         --non-interactive|--no-wizard|-n) INTERACTIVE=false ;;
-        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard]"; exit 0 ;;
+        --upgrade-os) UPGRADE_OS=true ;;
+        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]"; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -67,9 +80,30 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "run as root (sudo $0)"
-for t in bash curl jq awk sed date mktemp find install openssl; do
-    command -v "$t" >/dev/null 2>&1 || die "missing dependency '$t' (e.g. apt install curl jq)"
-done
+
+# Interactive input: stdin when it is a terminal, otherwise /dev/tty (under
+# `curl | sudo bash` stdin is the pipe). TTY_FD stays empty when there is
+# no terminal at all or --non-interactive was given.
+TTY_FD=""
+if $INTERACTIVE && [[ -t 1 ]]; then
+    if [[ -t 0 ]]; then TTY_FD=0
+    elif { exec 3</dev/tty; } 2>/dev/null; then TTY_FD=3
+    fi
+fi
+
+# System check: optional OS upgrade, then install any missing dependency
+# (bash curl jq awk sed openssl flock coreutils findutils tar ca-certificates)
+# with the detected package manager. The logic lives in abuse-checker.sh.
+if ! $UPGRADE_OS && [[ -n "$TTY_FD" ]]; then
+    read -r -u "$TTY_FD" -p "Would you like to update system packages (OS upgrade) before installing? [y/N] " reply || reply=""
+    [[ "$reply" =~ ^[Yy] ]] && UPGRADE_OS=true
+fi
+say "checking system dependencies"
+deps_args=(--install-deps)
+$UPGRADE_OS && deps_args+=(--upgrade-os)
+bash "$SRC/abuse-checker.sh" "${deps_args[@]}" </dev/null | sed 's/^/    /' \
+    || die "required dependencies could not be installed (see above)"
+command -v install >/dev/null 2>&1 || die "'install' (coreutils) is required"
 for f in abuse-checker.sh systemd/abuse-checker.service systemd/abuse-checker.timer \
          systemd/abuse-checker-watchdog.service systemd/abuse-checker-watchdog.timer \
          config/secrets.conf.example config/ips.txt.example \
@@ -228,15 +262,9 @@ wizard() {
 
 # Under `curl | sudo bash` stdin is the pipe, so answers are read from the
 # controlling terminal (/dev/tty) instead.
-TTY_FD=0
-if $INTERACTIVE && [[ -t 1 ]]; then
-    if [[ -t 0 ]]; then
-        wizard
-    elif { exec 3</dev/tty; } 2>/dev/null; then
-        TTY_FD=3
-        wizard
-        exec 3<&-
-    fi
+if [[ -n "$TTY_FD" ]]; then
+    wizard
+    [[ "$TTY_FD" == "3" ]] && exec 3<&-
 fi
 
 cat <<MSG
