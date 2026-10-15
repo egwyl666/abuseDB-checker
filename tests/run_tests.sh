@@ -1012,6 +1012,12 @@ check "no curl, no wget, install fails -> clear error" bash -c '[[ $1 -ne 0 ]] &
 BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_TARBALL="$WORK/rel/good.tar.gz")"
 check "everything present -> no package manager calls" test ! -s "$MOCK_LOG/pkg.log"
 check "bootstrap tests leave no temp dirs" test -z "$(ls -A "$TMPDIR")"
+for rd in README.md README.uk.md; do
+    UNI="$(awk '/^sudo sh -c '"'"'u=https/{f=1} f{print} f&&/fi'"'"'$/{exit}' "$ROOT/$rd")"
+    check "$rd: universal no-curl command is valid sh" bash -c '[[ -n "$1" ]] && sh -n <<< "${1#sudo }"' _ "$UNI"
+    check "$rd: universal command tries curl, then wget, then installs curl" bash -c 'grep -q "command -v curl" <<< "$1" && grep -q "wget -qO-" <<< "$1" && grep -q "apt-get install -y -qq curl" <<< "$1" && grep -q "pacman -Sy" <<< "$1"' _ "$UNI"
+    check "$rd: wget one-liner" grep -qF 'sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"' "$ROOT/$rd"
+done
 check "wizard reads answers from /dev/tty" grep -q 'exec 3</dev/tty' "$ROOT/install.sh"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
