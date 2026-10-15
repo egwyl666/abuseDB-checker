@@ -1,7 +1,7 @@
 # abuse-checker
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 [English](README.md) · **Українська**
@@ -184,7 +184,7 @@ tests/run_tests.sh          офлайн-набір тестів (викорис
 ### Встановлення однією командою
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 Команда завантажує `install.sh`. Поруч із ним немає файлів репозиторію, тому
@@ -192,16 +192,28 @@ curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/insta
 (`https://github.com/egwyl666/abuseDB-checker/archive/refs/heads/main.tar.gz`)
 у приватний каталог `mktemp -d` і розпаковує його. Потім виконує `bash -n` для
 кожного скрипта і встановлює лише тоді, коли всі перевірки пройдено.
-Тимчасовий каталог після цього видаляється. Майстер налаштування теж працює,
-бо читає відповіді з `/dev/tty`, а не з каналу.
+Тимчасовий каталог після цього видаляється. Команда залишає stdin на вашому
+терміналі, тож майстер налаштування та запитання про оновлення ОС працюють
+як звичайно.
+
+> **Чому не `curl ... | sudo bash`?** Такий варіант теж працює, але в Ubuntu
+> 22.04+ sudo запускає команду у власному псевдотерміналі (`use_pty`). Коли
+> stdin зайнятий каналом, інсталятор може опинитися поза групою процесів
+> переднього плану терміналу, і тоді читання з клавіатури зупинило б
+> процес. Інсталятор це розпізнає: пропускає запитання, використовує
+> типові значення (без оновлення ОС, без майстра) і показує команду
+> `sudo bash -c` вище. Коли читати з `/dev/tty` вдається, кожне запитання
+> чекає відповіді не довше 120 с, а не безкінечно.
 
 Варіанти:
 
 ```bash
-# без майстра (Ansible, cloud-init, CI)
+# без майстра (Ansible, cloud-init, CI); тут варіант із каналом підходить
 curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash -s -- --non-interactive
+# спочатку з оновленням ОС
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)" -- --upgrade-os
 # інша гілка
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo AC_BRANCH=dev bash
+sudo AC_BRANCH=dev bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 Якщо хочете спочатку переглянути скрипт:
@@ -983,6 +995,7 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | `invalid OnCalendar expression` | Перевірте вираз через `systemd-analyze calendar '<вираз>'` або використайте одну з готових специфікацій. |
 | Надійшло `[WATCHDOG ALERT]` | Сервіс тричі впав за 15 хвилин або завис. Перегляньте рядки логу в сповіщенні та `journalctl -u abuse-checker -n 100`. Відновлення вже виконано, і наступний запуск за таймером спробує знову. |
 | `start request repeated too quickly` | Досягнуто ліміту запусків (3 за 15 хвилин). Watchdog скидає його; також можна виконати `sudo systemctl reset-failed abuse-checker`. |
+| Інсталятор однією командою зупиняється на запитанні й не реагує на введення | Ви використали `curl ... \| sudo bash` зі старішим інсталятором (1.4.0 або раніше). Встановлення вже завершено, тож натисніть Ctrl+C. Наступного разу використовуйте `sudo bash -c "$(curl -fsSL ...install.sh)"`; починаючи з 1.5.0 варіант із каналом більше не блокується. |
 | `missing dependencies: ... (run: sudo abuse-checker --doctor)` | Виконайте `sudo abuse-checker --doctor`, він встановить відсутнє. Якщо не вдається, перегляньте помилку пакетного менеджера (недоступне дзеркало, зафіксовані пакети). |
 | `--doctor`: `cannot reach https://api.abuseipdb.com` | Вихідний HTTPS блокують DNS, фаєрвол чи проксі. Перевірте через `curl -sI https://api.abuseipdb.com`. |
 | У рядку звіту немає «View ... detail(s)» | Для цієї IP-адреси немає скарг за вибраний період, або вона чиста. Для підмережі хости показуються лише тоді, коли AbuseIPDB їх повернув. |

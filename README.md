@@ -1,7 +1,7 @@
 # abuse-checker
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 **English** · [Українська](README.uk.md)
@@ -177,7 +177,7 @@ tests/run_tests.sh          offline test suite (uses tests/mock_curl.sh)
 ### One-line install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 This downloads `install.sh`. Because there are no repository files next to it,
@@ -185,16 +185,27 @@ it fetches the tarball of the `main` branch
 (`https://github.com/egwyl666/abuseDB-checker/archive/refs/heads/main.tar.gz`)
 into a private `mktemp -d` directory and extracts it. It then runs `bash -n` on
 every script and only installs if all of them pass. The temporary directory is
-removed afterwards. The setup wizard still works, because it reads your
-answers from `/dev/tty` rather than from the pipe.
+removed afterwards. The command keeps stdin on your terminal, so the setup
+wizard and the OS-upgrade question work normally.
+
+> **Why not `curl ... | sudo bash`?** That form also works, but on Ubuntu
+> 22.04+ sudo runs the command in its own pseudo-terminal (`use_pty`). With
+> stdin taken by the pipe, the installer can end up outside the terminal's
+> foreground process group, where reading the keyboard would stop the
+> process. The installer detects this: it skips the questions, uses the
+> defaults (no OS upgrade, no wizard) and prints the `sudo bash -c` command
+> above. When it can read from `/dev/tty`, each question times out after
+> 120 s instead of waiting forever.
 
 Variants:
 
 ```bash
-# no wizard (Ansible, cloud-init, CI)
+# no wizard (Ansible, cloud-init, CI); the pipe form is fine here
 curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash -s -- --non-interactive
+# with an OS upgrade first
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)" -- --upgrade-os
 # another branch
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo AC_BRANCH=dev bash
+sudo AC_BRANCH=dev bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 If you prefer to read the script first:
@@ -941,6 +952,7 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `invalid OnCalendar expression` | Test the expression with `systemd-analyze calendar '<expr>'`, or use one of the presets. |
 | `[WATCHDOG ALERT]` received | The service failed 3 times within 15 minutes, or hung. Read the log lines in the alert and `journalctl -u abuse-checker -n 100`. Recovery has already run, and the next timer run retries. |
 | `start request repeated too quickly` | The start limit (3 per 15 minutes) was hit. The watchdog resets it, or run `sudo systemctl reset-failed abuse-checker`. |
+| One-line installer stops at a question and does not react to input | You used `curl ... \| sudo bash` with an older installer (1.4.0 or earlier). Installation was already finished, so press Ctrl+C. Use `sudo bash -c "$(curl -fsSL ...install.sh)"` next time; from 1.5.0 the pipe form no longer blocks. |
 | `missing dependencies: ... (run: sudo abuse-checker --doctor)` | Run `sudo abuse-checker --doctor`; it installs what is missing. If that fails, check the package manager's error (offline mirror, held packages). |
 | `--doctor`: `cannot reach https://api.abuseipdb.com` | DNS, firewall or proxy is blocking outbound HTTPS. Test with `curl -sI https://api.abuseipdb.com`. |
 | Report row has no "View ... detail(s)" | That IP has no reports in the window, or it is clean. Subnets list hosts only when AbuseIPDB returned some. |

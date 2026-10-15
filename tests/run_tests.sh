@@ -850,6 +850,10 @@ check "AUTO_INSTALL_DEPS=false: clear error instead" bash -c '[[ $1 -ne 0 ]] && 
 unset ABUSE_CHECKER_PKG_MGR ABUSE_CHECKER_PKG_CMD ABUSE_CHECKER_FAKE_MISSING_FILE ABUSE_CHECKER_SYSTEMCTL ABUSE_CHECKER_DOCTOR_URL ABUSE_CHECKER_OS_RELEASE
 check "install.sh: --upgrade-os flag + exact prompt" bash -c 'grep -q -- "--upgrade-os) UPGRADE_OS=true" "$1" && grep -qF "Would you like to update system packages (OS upgrade) before installing? [y/N]" "$1"' _ "$ROOT/install.sh"
 check "install.sh: uses --install-deps before installing" grep -q 'deps_args=(--install-deps)' "$ROOT/install.sh"
+check "install.sh: /dev/tty only used in the terminal foreground" grep -q 'elif tty_in_foreground && { exec 3</dev/tty; }' "$ROOT/install.sh"
+check "install.sh: every prompt read has a timeout in pipe mode" bash -c '[[ $(grep -c "read -r[^|]*-u \"\$TTY_FD\"" "$1") -gt 0 && $(grep "read -r[^|]*-u \"\$TTY_FD\"" "$1" | grep -vc "READ_T\[@\]") -eq 0 ]]' _ "$ROOT/install.sh"
+check "install.sh: piped, no foreground tty -> defaults, no hang" bash -c 'out="$(cd "$1" && timeout 30 bash -c "ABUSE_CHECKER_TTY_FOREGROUND=0 ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash -n install.sh && echo ok")"; [[ "$out" == ok ]]' _ "$ROOT"
+check "README recommends sudo bash -c \"\$(curl ...)\"" grep -q '^sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"$' "$ROOT/README.md"
 
 # ---------------------------------------------------------------------------
 section "Self-update: --check-update / --update / AUTO_UPDATE"
