@@ -3,14 +3,30 @@ Description=AbuseIPDB abuse checker for monitored IPs/subnets
 Documentation=file:///usr/local/share/doc/abuse-checker/README.md
 Wants=network-online.target
 After=network-online.target
+# Up to 3 starts (first try + 2 restarts) per 15 minutes; after that the
+# unit is marked failed and the watchdog takes over.
+StartLimitIntervalSec=15min
+StartLimitBurst=3
+OnFailure=abuse-checker-watchdog.service
 
 [Service]
 Type=oneshot
 User=abusechecker
 Group=abusechecker
-EnvironmentFile=/etc/abuse-checker/secrets.conf
+# Secrets are provided by the generated drop-in
+# abuse-checker.service.d/10-secrets.conf (LoadCredentialEncrypted= for
+# systemd-creds, or LoadCredential= of the OpenSSL master key).
+# AUTO_UPDATE=true: "+" runs this step as root outside the sandbox so it can
+# replace the binary; "-" means a failed update never blocks the check.
+ExecStartPre=-+/usr/local/bin/abuse-checker --auto-update
 ExecStart=/usr/local/bin/abuse-checker --run
-TimeoutStartSec=30min
+# Hang protection. A Type=oneshot run counts as "starting" until it exits,
+# so TimeoutStartSec is what actually kills a hung run; RuntimeMaxSec is set
+# as well for clarity. Both are 15 minutes.
+TimeoutStartSec=15min
+RuntimeMaxSec=15min
+Restart=on-failure
+RestartSec=60s
 Nice=10
 
 # Sandboxing

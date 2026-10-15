@@ -28,7 +28,43 @@ respond() { # code body [remaining]
     return 0
 }
 
+up="$(sed -n 's/^upload-file = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"
+[[ -n "$up" && -f "$up" ]] && cat "$up" >> "$MOCK_LOG/mail.log"
+
 case "$url" in
+    https://jira.test*)          # Jira REST API emulation
+        method="$(sed -n 's/^request = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"
+        path="${url#https://jira.test}"
+        echo "${method:-POST} ${path%%\?*}" >> "$MOCK_LOG/jira.log"
+        grep -q '^header = "Authorization: ' <<< "$cfg" && echo auth-ok >> "$MOCK_LOG/jira_auth.log"
+        sed -n 's/^header = "Authorization: \(.*\)"$/\1/p' <<< "$cfg" >> "$MOCK_LOG/jira_authvalues.log"
+        [[ -n "$data" ]] && { jq -c . "${data#@}" >> "$MOCK_LOG/jira_payloads.log"; }
+        case "${method:-POST} $path" in
+            "GET /rest/api/3/search/jql"*)
+                [[ -n "${MOCK_JIRA_V3_404:-}" ]] && { respond 404 '{"errorMessages":["not found"]}'; exit 0; } ;&
+            "GET /rest/api/2/search"*)
+                if [[ -n "${MOCK_JIRA_EXISTING:-}" ]]; then respond 200 "{\"issues\":[{\"key\":\"$MOCK_JIRA_EXISTING\"}]}"
+                else respond 200 '{"issues":[]}'; fi ;;
+            "POST /rest/api/2/issue")
+                if [[ -n "${MOCK_JIRA_FAIL:-}" ]]; then respond 400 '{"errorMessages":[],"errors":{"issuetype":"Specify a valid issue type"}}'
+                else respond 201 '{"id":"10042","key":"SEC-42"}'; fi ;;
+            "POST /rest/api/2/issue/"*"/comment") respond 201 '{"id":"1"}' ;;
+            *"/attachments") echo "attach $path" >> "$MOCK_LOG/jira.log"; respond 200 '[{"id":"9"}]' ;;
+            *) respond 404 '{}' ;;
+        esac
+        exit 0 ;;
+    */abuse-checker.sh)          # self-update: remote version probe
+        echo "$url" >> "$MOCK_LOG/update.log"
+        if [[ -n "${MOCK_REMOTE_SCRIPT:-}" && -f "$MOCK_REMOTE_SCRIPT" ]]; then
+            respond 200 "$(cat "$MOCK_REMOTE_SCRIPT")"
+        else
+            respond 404 'Not Found'
+        fi
+        exit 0 ;;
+    *.tar.gz)                    # self-update / bootstrap: repository tarball
+        echo "$url" >> "$MOCK_LOG/update.log"
+        [[ -n "${MOCK_TARBALL:-}" && -f "$MOCK_TARBALL" ]] || { echo "curl: (22) 404" >&2; exit 22; }
+        cp "$MOCK_TARBALL" "$out"; exit 0 ;;
     *api.telegram.org*|*hooks.slack.test*|smtp*)
         echo "$url" >> "$MOCK_LOG/notify.log"
         [[ -n "$data" ]] && cat "${data#@}" >> "$MOCK_LOG/slack_payload.log"

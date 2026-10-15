@@ -1,0 +1,24 @@
+[Unit]
+Description=abuse-checker watchdog: recover from failed runs and alert
+Documentation=file:///usr/local/share/doc/abuse-checker/README.md
+# Started by OnFailure= of abuse-checker.service and by
+# abuse-checker-watchdog.timer.
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root: it must reset the failed unit, restart the timer, read the
+# journal and decrypt the secrets to send the alert.
+ExecStart=/usr/local/bin/abuse-checker --watchdog-recover
+TimeoutStartSec=5min
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0027
