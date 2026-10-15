@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.3.0"
+readonly AC_VERSION="1.4.0"
 # Upstream repository used by --check-update / --update (override with
 # REPO_SLUG / REPO_BRANCH in the secrets store).
 readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"
@@ -17,10 +17,14 @@ CONF_DIR="${ABUSE_CHECKER_CONF_DIR:-/etc/abuse-checker}"
 SECRETS_FILE="${ABUSE_CHECKER_SECRETS:-$CONF_DIR/secrets.conf}"
 STATE_DIR="${ABUSE_CHECKER_STATE_DIR:-/var/lib/abuse-checker}"
 CURL_BIN="${ABUSE_CHECKER_CURL:-curl}"
+IPS_FILE="${IPS_FILE:-$CONF_DIR/ips.txt}"
+STATE_FILE="${STATE_FILE:-$STATE_DIR/state.json}"
 SERVICE_USER="abusechecker"
 
 TMPD=""
 RAM_FILES=()
+IP_ARGS=()
+IP_COMMENT=""
 RAM_COPY=""
 MODE="run"
 DRY_RUN=false
@@ -150,29 +154,47 @@ is_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
     for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
 }
-is_ipv6() { [[ "$1" =~ ^[0-9a-fA-F:]+$ && "$1" == *:* ]]; }
+# Strict-enough IPv6 check: hex groups, at most one "::", optional
+# trailing dotted IPv4 (e.g. ::ffff:192.0.2.1).
+is_ipv6() {
+    local a="$1" v4="" g n=0
+    [[ "$a" == *:* && "$a" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    if [[ "$a" == *.* ]]; then v4="${a##*:}"; is_ipv4 "$v4" || return 1; a="${a%:*}:0:0"; fi
+    [[ "$a" != *:::* && "$(grep -o '::' <<< "$a" | wc -l)" -le 1 ]] || return 1
+    [[ "$a" =~ ^:[^:] || "$a" =~ [^:]:$ ]] && return 1
+    IFS=':' read -r -a _g <<< "$a"
+    for g in "${_g[@]}"; do
+        [[ -z "$g" ]] && continue
+        [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        n=$((n + 1))
+    done
+    if [[ "$a" == *::* ]]; then (( n <= 7 )); else (( n == 8 )); fi
+}
+
+# valid_target "IP" or "IP/prefix"
+valid_target() {
+    local t="$1" addr="${1%%/*}" prefix=""
+    [[ "$t" == */* ]] && prefix="${t#*/}"
+    if is_ipv4 "$addr"; then
+        [[ -z "$prefix" ]] || { [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && (( 10#$prefix <= 32 )); }
+    elif is_ipv6 "$addr"; then
+        [[ -z "$prefix" ]] || { [[ "$prefix" =~ ^[0-9]{1,3}$ ]] && (( 10#$prefix <= 128 )); }
+    else
+        return 1
+    fi
+}
 
 # Print one valid target per line (comments and blanks ignored).
 read_targets() {
-    local file="$1" line addr prefix
+    local file="$1" line
     [[ -r "$file" ]] || die "IP list not readable: $file"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%%#*}"
         line="$(trim "$line")"
         [[ -z "$line" ]] && continue
-        addr="${line%%/*}"
-        prefix=""
-        [[ "$line" == */* ]] && prefix="${line#*/}"
-        if is_ipv4 "$addr"; then
-            if [[ -n "$prefix" ]] && ! { [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix <= 32 )); }; then
-                warn "skipping invalid CIDR: $line"; continue
-            fi
-        elif is_ipv6 "$addr"; then
-            if [[ -n "$prefix" ]] && ! { [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix <= 128 )); }; then
-                warn "skipping invalid CIDR: $line"; continue
-            fi
-        else
-            warn "skipping invalid entry: $line"; continue
+        if ! valid_target "$line"; then
+            if [[ "$line" == */* ]]; then warn "skipping invalid CIDR: $line"; else warn "skipping invalid entry: $line"; fi
+            continue
         fi
         printf '%s\n' "$line"
     done < "$file" | awk '!seen[$0]++'
@@ -849,6 +871,8 @@ cmd_uninstall() {
                   "$r/usr/local/share/doc/abuse-checker"
                   "$r/etc/systemd/system/abuse-checker.service"
                   "$r/etc/systemd/system/abuse-checker.timer"
+                  "$r/etc/systemd/system/abuse-checker-watchdog.service"
+                  "$r/etc/systemd/system/abuse-checker-watchdog.timer"
                   "$r/etc/systemd/system/abuse-checker.service.d"
                   "$r/etc/systemd/system/abuse-checker.timer.d")
     [[ $EUID -eq 0 || -n "$r" ]] || die "run as root: sudo abuse-checker --uninstall"
@@ -876,13 +900,13 @@ cmd_uninstall() {
         fi
     fi
     if [[ -z "$r" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-        systemctl disable --now abuse-checker.timer 2>/dev/null || true
+        systemctl disable --now abuse-checker.timer abuse-checker-watchdog.timer 2>/dev/null || true
         systemctl stop abuse-checker.service 2>/dev/null || true
     fi
     for p in "${app[@]}"; do [[ -e "$p" ]] && { rm -rf "$p"; echo "removed $p"; }; done
     if [[ -z "$r" ]] && command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
         systemctl daemon-reload
-        systemctl reset-failed abuse-checker.service abuse-checker.timer 2>/dev/null || true
+        systemctl reset-failed abuse-checker.service abuse-checker.timer abuse-checker-watchdog.service 2>/dev/null || true
     fi
     if [[ "$choice" == "purge" ]]; then
         [[ -f "$conf/secrets.conf" ]] && secure_rm "$conf/secrets.conf"
@@ -1027,6 +1051,376 @@ cmd_auto_update() {
 }
 
 # ---------------------------------------------------------------------------
+# IP / CIDR pool management (--list-ips, --add-ip, --del-ip, --edit-ips)
+# ---------------------------------------------------------------------------
+# Entry part of an ips.txt line (comment stripped, trimmed).
+line_entry() { local l="${1%%#*}"; trim "$l"; }
+# Inline comment of an ips.txt line (without '#').
+line_comment() { [[ "$1" == *"#"* ]] || return 0; trim "${1#*#}"; }
+
+# Write $2 over ips.txt ($1) atomically, keeping 0644 root:abusechecker.
+replace_ips_file() {
+    local dest="$1" src="$2" tmp
+    tmp="$(mktemp "$(dirname "$dest")/.ips.XXXXXX")"
+    cat "$src" > "$tmp"
+    chmod 0644 "$tmp"
+    if [[ -e "$dest" ]]; then
+        chown --reference="$dest" "$tmp" 2>/dev/null || true
+    elif [[ $EUID -eq 0 ]] && getent group "$SERVICE_USER" >/dev/null 2>&1; then
+        chown "root:$SERVICE_USER" "$tmp"
+    fi
+    mv -f "$tmp" "$dest"
+}
+
+cmd_list_ips() {
+    local f="$IPS_FILE" n=0 line entry comment status state="$STATE_FILE"
+    [[ -r "$f" ]] || die "IP list not readable: $f"
+    [[ -r "$state" ]] || state=/dev/null
+    printf '%-4s %-28s %-18s %s\n' "#" "IP / SUBNET" "STATUS" "COMMENT"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        entry="$(line_entry "$line")"
+        [[ -z "$entry" ]] && continue
+        comment="$(line_comment "$line")"
+        n=$((n + 1))
+        if ! valid_target "$entry"; then
+            status="INVALID"
+        else
+            status="$(jq -r --arg k "$entry" '
+                (.ips // {})[$k] as $e
+                | if $e == null then "UNCHECKED"
+                  elif $e.dirty then "DIRTY (\($e.score)%)"
+                  else "CLEAN" end' "$state" 2>/dev/null)"
+            [[ -n "$status" ]] || status="UNCHECKED"
+        fi
+        printf '%-4s %-28s %-18s %s\n' "$n" "$entry" "$status" "$comment"
+    done < "$f"
+    (( n > 0 )) || echo "(no entries)"
+    echo
+    echo "$n entr$( ((n == 1)) && echo y || echo ies) in $f"
+}
+
+# --add-ip IP [IP...] [--comment TEXT]: all-or-nothing validation.
+cmd_add_ip() {
+    local comment="$1"; shift
+    local t added=0 tmp
+    local -a bad=() new=() existing=()
+    require_admin --add-ip
+    (( $# > 0 )) || die "usage: abuse-checker --add-ip <IP_OR_CIDR> [...] [--comment \"text\"]"
+    comment="${comment//$'\n'/ }"
+    [[ -f "$IPS_FILE" ]] || : > "$IPS_FILE"
+    mapfile -t existing < <(while IFS= read -r l || [[ -n "$l" ]]; do line_entry "$l"; echo; done < "$IPS_FILE" | sed '/^$/d' | tr 'A-F' 'a-f')
+    for t in "$@"; do
+        t="$(trim "$t")"
+        valid_target "$t" || { bad+=("$t"); continue; }
+        local lt; lt="$(tr 'A-F' 'a-f' <<< "$t")"
+        if printf '%s\n' "${existing[@]}" "${new[@]}" | tr 'A-F' 'a-f' | grep -qxF -- "$lt"; then
+            echo "skip: $t is already in $IPS_FILE"
+            continue
+        fi
+        new+=("$t")
+    done
+    if (( ${#bad[@]} > 0 )); then
+        printf 'error: invalid IP/CIDR: %s\n' "${bad[@]}" >&2
+        echo "nothing changed (expected IPv4, IPv6, or CIDR such as 203.0.113.0/24)" >&2
+        return 1
+    fi
+    (( ${#new[@]} > 0 )) || { echo "nothing to add"; return 0; }
+    tmp="$(mktemp "${TMPDIR:-/tmp}/abuse-checker-ips.XXXXXX")"
+    cat "$IPS_FILE" > "$tmp"
+    [[ -s "$tmp" && "$(tail -c1 "$tmp")" != "" ]] && echo >> "$tmp"
+    for t in "${new[@]}"; do
+        if [[ -n "$comment" ]]; then printf '%-22s # %s\n' "$t" "$comment" >> "$tmp"; else printf '%s\n' "$t" >> "$tmp"; fi
+        echo "added: $t"; added=$((added + 1))
+    done
+    replace_ips_file "$IPS_FILE" "$tmp"; rm -f "$tmp"
+    echo "$added entr$( ((added == 1)) && echo y || echo ies) added to $IPS_FILE"
+}
+
+# --del-ip IP [IP...]: remove from ips.txt and from state.json.
+cmd_del_ip() {
+    local t tmp sf removed=0
+    local -a want=()
+    require_admin --del-ip
+    (( $# > 0 )) || die "usage: abuse-checker --del-ip <IP_OR_CIDR> [...]"
+    [[ -f "$IPS_FILE" ]] || die "IP list not found: $IPS_FILE"
+    for t in "$@"; do want+=("$(trim "$t" | tr 'A-F' 'a-f')"); done
+    tmp="$(mktemp "${TMPDIR:-/tmp}/abuse-checker-ips.XXXXXX")"
+    local line e found=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        e="$(line_entry "$line" | tr 'A-F' 'a-f')"
+        if [[ -n "$e" ]] && printf '%s\n' "${want[@]}" | grep -qxF -- "$e"; then
+            found+="$e"$'\n'; removed=$((removed + 1)); continue
+        fi
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$IPS_FILE"
+    [[ -e "$tmp" ]] || : > "$tmp"
+    for t in "${want[@]}"; do
+        if grep -qxF -- "$t" <<< "$found"; then echo "removed: $t"; else echo "not found: $t"; fi
+    done
+    (( removed > 0 )) && replace_ips_file "$IPS_FILE" "$tmp"
+    rm -f "$tmp"
+    # Drop state for the removed targets right away (case-insensitive keys).
+    for sf in "$STATE_FILE" "$STATE_DIR/state.dryrun.json"; do
+        [[ -f "$sf" ]] || continue
+        tmp="$(mktemp "$(dirname "$sf")/.state.XXXXXX")"
+        if printf '%s\n' "${want[@]}" | jq -R . | jq -s . > "$tmp.keys" \
+           && jq --slurpfile k "$tmp.keys" '.ips |= with_entries(select((.key | ascii_downcase) as $x | $k[0] | index($x) | not))' "$sf" > "$tmp"; then
+            chmod 0640 "$tmp"; chown --reference="$sf" "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$sf"
+        else
+            rm -f "$tmp"; warn "could not update $sf"
+        fi
+        rm -f "$tmp.keys"
+    done
+    echo "$removed entr$( ((removed == 1)) && echo y || echo ies) removed"
+    (( removed > 0 ))
+}
+
+pick_editor() {
+    local e="${VISUAL:-${EDITOR:-}}"
+    if [[ -z "$e" ]]; then if command -v nano >/dev/null 2>&1; then e="nano"; else e="vi"; fi; fi
+    printf '%s' "$e"
+}
+
+# Print "lineno: entry" for every invalid line of a file.
+invalid_ip_lines() {
+    local n=0 line e
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1)); e="$(line_entry "$line")"
+        [[ -z "$e" ]] || valid_target "$e" || printf '  line %d: %s\n' "$n" "$e"
+    done < "$1"
+}
+
+cmd_edit_ips() {
+    local tmp editor bad reply
+    require_admin --edit-ips
+    [[ -f "$IPS_FILE" ]] || : > "$IPS_FILE"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/abuse-checker-ips.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" EXIT
+    cat "$IPS_FILE" > "$tmp"
+    editor="$(pick_editor)"
+    # Invalid entries that were already there are reported but do not block.
+    local before
+    before="$(invalid_ip_lines "$IPS_FILE" | sed 's/^  line [0-9]*: //')"
+    while true; do
+        # shellcheck disable=SC2086  # allow EDITOR="code --wait"
+        $editor "$tmp" || die "editor exited with an error; ips.txt unchanged"
+        bad="$(invalid_ip_lines "$tmp" | while IFS= read -r l; do
+                   grep -qxF -- "${l#*: }" <<< "$before" || printf '%s\n' "$l"; done)"
+        [[ -n "$before" ]] && printf 'note: existing invalid entries (skipped at run time): %s\n' "$(paste -sd' ' - <<< "$before")" >&2
+        [[ -z "$bad" ]] && break
+        echo "warning: invalid IP/CIDR entries:" >&2
+        echo "$bad" >&2
+        if [[ -t 0 ]]; then
+            read -r -p "[E]dit again, [s]ave anyway (invalid lines are skipped at run time), or [a]bort? " reply || reply=a
+            case "$reply" in
+                [Ss]*) break ;;
+                [Aa]*) echo "aborted; ips.txt unchanged"; return 1 ;;
+            esac
+        else
+            echo "not saving (no terminal to confirm); ips.txt unchanged" >&2
+            return 1
+        fi
+    done
+    if cmp -s "$tmp" "$IPS_FILE"; then echo "no changes"; return 0; fi
+    replace_ips_file "$IPS_FILE" "$tmp"
+    echo "saved $IPS_FILE ($(read_targets "$IPS_FILE" 2>/dev/null | wc -l) valid entr$( [[ "$(read_targets "$IPS_FILE" 2>/dev/null | wc -l)" == 1 ]] && echo y || echo ies))"
+}
+
+# ---------------------------------------------------------------------------
+# Scheduling (--schedule)
+# ---------------------------------------------------------------------------
+TIMER_DROPIN_DIR="${ABUSE_CHECKER_TIMER_DROPIN_DIR:-/etc/systemd/system/abuse-checker.timer.d}"
+SYSTEMCTL_BIN="${ABUSE_CHECKER_SYSTEMCTL:-systemctl}"
+SYSTEMD_ANALYZE_BIN="${ABUSE_CHECKER_SYSTEMD_ANALYZE:-systemd-analyze}"
+JOURNALCTL_BIN="${ABUSE_CHECKER_JOURNALCTL:-journalctl}"
+DEFAULT_SCHEDULE="*-*-* 06:00:00"
+
+systemd_running() { [[ -n "${ABUSE_CHECKER_SYSTEMCTL:-}" || -d /run/systemd/system ]]; }
+
+# schedule_to_calendars SPEC -> one OnCalendar expression per line.
+schedule_to_calendars() {
+    local spec n t h m
+    spec="$(trim "${1,,}")"
+    spec="${spec#every }"
+    case "$spec" in
+        hourly|1h) echo "hourly" ;;
+        daily|1d|24h) echo "$DEFAULT_SCHEDULE" ;;
+        2x|2x/day|twice) printf '%s\n' "*-*-* 06:00:00" "*-*-* 18:00:00" ;;
+        4x|4x/day) echo "*-*-* 00/6:00:00" ;;
+        [0-9]h|[0-9][0-9]h)
+            n="${spec%h}"; n=$((10#$n))
+            case "$n" in 2|3|4|6|8|12) echo "*-*-* 00/$n:00:00" ;;
+                *) echo "error: '${n}h' must divide 24 (1,2,3,4,6,8,12,24)" >&2; return 1 ;; esac ;;
+        *)
+            if [[ "$spec" =~ ^[0-9]{1,2}:[0-9]{2}([[:space:]]*,[[:space:]]*[0-9]{1,2}:[0-9]{2})*$ ]]; then
+                IFS=',' read -r -a _times <<< "$spec"
+                for t in "${_times[@]}"; do
+                    t="$(trim "$t")"; h="${t%%:*}"; m="${t#*:}"
+                    (( 10#$h <= 23 && 10#$m <= 59 )) || { echo "error: invalid time '$t'" >&2; return 1; }
+                    printf '*-*-* %02d:%02d:00\n' "$((10#$h))" "$((10#$m))"
+                done | awk '!seen[$0]++'
+            else
+                printf '%s\n' "$1"    # raw OnCalendar expression (validated below)
+            fi ;;
+    esac
+}
+
+# Validate with systemd-analyze when available; print next elapse times.
+validate_calendar() {
+    local c="$1"
+    command -v "$SYSTEMD_ANALYZE_BIN" >/dev/null 2>&1 || return 0
+    "$SYSTEMD_ANALYZE_BIN" calendar "$c" >/dev/null 2>&1
+}
+
+print_next_runs() {
+    local c
+    if command -v "$SYSTEMD_ANALYZE_BIN" >/dev/null 2>&1; then
+        while IFS= read -r c; do
+            [[ -n "$c" ]] || continue
+            echo "  $c"
+            "$SYSTEMD_ANALYZE_BIN" calendar --iterations=3 "$c" 2>/dev/null \
+                | sed -n 's/^ *\(Next elapse\|Iteration #[0-9]*\|(in UTC)\): */    next: /p' | grep -v '(in UTC)' | head -n3 || true
+        done
+    fi
+    if systemd_running; then
+        echo "Timer next trigger: $("$SYSTEMCTL_BIN" show abuse-checker.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)"
+    fi
+}
+
+current_calendars() {
+    local f="$TIMER_DROPIN_DIR/override.conf"
+    if [[ -f "$f" ]]; then
+        sed -n 's/^OnCalendar=\(..*\)$/\1/p' "$f"
+    else
+        sed -n 's/^OnCalendar=\(..*\)$/\1/p' "${ABUSE_CHECKER_TIMER_UNIT:-/etc/systemd/system/abuse-checker.timer}" 2>/dev/null \
+            || echo "$DEFAULT_SCHEDULE"
+    fi
+}
+
+cmd_schedule() {
+    local spec="${1:-show}" cal f tmp
+    local -a cals=()
+    case "$spec" in
+        show|"")
+            echo "Schedule ($( [[ -f "$TIMER_DROPIN_DIR/override.conf" ]] && echo "custom: $TIMER_DROPIN_DIR/override.conf" || echo default)):"
+            current_calendars | print_next_runs
+            return 0 ;;
+        reset|default)
+            require_schedule_admin
+            rm -f "$TIMER_DROPIN_DIR/override.conf"
+            rmdir "$TIMER_DROPIN_DIR" 2>/dev/null || true
+            reload_timer
+            echo "schedule reset to the default (daily 06:00)"
+            return 0 ;;
+    esac
+    require_schedule_admin
+    mapfile -t cals < <(schedule_to_calendars "$spec") || true
+    (( ${#cals[@]} > 0 )) || die "could not parse schedule '$spec'"
+    for cal in "${cals[@]}"; do
+        validate_calendar "$cal" || die "invalid OnCalendar expression: '$cal' (checked with systemd-analyze calendar)"
+    done
+    mkdir -p "$TIMER_DROPIN_DIR"
+    f="$TIMER_DROPIN_DIR/override.conf"
+    tmp="$(mktemp "$TIMER_DROPIN_DIR/.override.XXXXXX")"
+    {
+        echo "# Generated by 'abuse-checker --schedule $spec'"
+        echo "[Timer]"
+        echo "OnCalendar="
+        for cal in "${cals[@]}"; do echo "OnCalendar=$cal"; done
+    } > "$tmp"
+    chmod 0644 "$tmp"; mv -f "$tmp" "$f"
+    echo "wrote $f"
+    reload_timer
+    echo "New schedule:"
+    printf '%s\n' "${cals[@]}" | print_next_runs
+}
+
+require_schedule_admin() {
+    if [[ $EUID -ne 0 && -z "${ABUSE_CHECKER_TIMER_DROPIN_DIR:-}" ]]; then
+        die "run as root: sudo abuse-checker --schedule ..."
+    fi
+}
+
+reload_timer() {
+    systemd_running || { echo "(systemd not running: drop-in written, timer not restarted)"; return 0; }
+    if ! { "$SYSTEMCTL_BIN" daemon-reload && "$SYSTEMCTL_BIN" restart abuse-checker.timer; }; then
+        warn "could not restart abuse-checker.timer"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Watchdog (--watchdog-recover)
+# ---------------------------------------------------------------------------
+# Run by abuse-checker-watchdog.service (as root) via OnFailure= and on its
+# own timer. Repairs what it can and alerts every connector when something
+# was wrong. A healthy system produces no alert.
+cmd_watchdog_recover() {
+    local -a problems=() actions=()
+    local lock="$STATE_DIR/.lock" last age max_h="${WATCHDOG_MAX_AGE_HOURS:-48}" logs body
+    # 1. Failed service (OnFailure= path, or found by the periodic check).
+    if systemd_running && "$SYSTEMCTL_BIN" is-failed --quiet abuse-checker.service 2>/dev/null; then
+        problems+=("abuse-checker.service is in the failed state (all restart attempts used)")
+        "$SYSTEMCTL_BIN" reset-failed abuse-checker.service 2>/dev/null && actions+=("reset the failed state of abuse-checker.service")
+    fi
+    # 2. Stale lock: file present but no process holds the flock.
+    if [[ -e "$lock" ]]; then
+        if command -v flock >/dev/null 2>&1 && flock -n "$lock" true 2>/dev/null; then
+            if [[ -n "$(find "$lock" -mmin +"${WATCHDOG_LOCK_MAX_MIN:-20}" 2>/dev/null)" ]]; then
+                rm -f "$lock"
+                problems+=("stale lock $lock (no process held it)")
+                actions+=("removed stale lock $lock")
+            fi
+        elif command -v flock >/dev/null 2>&1; then
+            info "watchdog: a run is in progress (lock held); leaving it alone"
+        fi
+    fi
+    # 3. Timer must be enabled and active.
+    if systemd_running; then
+        if ! "$SYSTEMCTL_BIN" is-enabled --quiet abuse-checker.timer 2>/dev/null; then
+            problems+=("abuse-checker.timer was not enabled")
+            "$SYSTEMCTL_BIN" enable abuse-checker.timer 2>/dev/null && actions+=("enabled abuse-checker.timer")
+        fi
+        if ! "$SYSTEMCTL_BIN" is-active --quiet abuse-checker.timer 2>/dev/null; then
+            problems+=("abuse-checker.timer was not active")
+            "$SYSTEMCTL_BIN" restart abuse-checker.timer 2>/dev/null && actions+=("restarted abuse-checker.timer")
+        fi
+    fi
+    # 4. No successful run for too long.
+    last="$(jq -r '.lastRun // empty' "$STATE_FILE" 2>/dev/null || true)"
+    if [[ -n "$last" ]]; then
+        age=$(( ( $(date +%s) - $(date -d "$last" +%s 2>/dev/null || date +%s) ) / 3600 ))
+        if (( age > max_h )); then problems+=("no successful run for ${age}h (last: $last, limit ${max_h}h)"); fi
+    fi
+
+    if (( ${#problems[@]} == 0 )); then
+        if systemd_running; then info "watchdog: healthy (timer active, no failed run, no stale lock)"
+        else info "watchdog: healthy (no stale lock; systemd not running, unit checks skipped)"; fi
+        return 0
+    fi
+    logs="$("$JOURNALCTL_BIN" -u abuse-checker.service -n 15 --no-pager -o short-iso 2>/dev/null | redact_stream || true)"
+    body="$(
+        echo "abuse-checker on $HOST_LABEL needed recovery at $(date '+%Y-%m-%d %H:%M %Z')."
+        echo
+        echo "Problems:"; printf ' - %s\n' "${problems[@]}"
+        echo
+        echo "Recovery actions:"
+        if (( ${#actions[@]} )); then printf ' - %s\n' "${actions[@]}"; else echo " - none possible automatically"; fi
+        echo
+        echo "Last 15 log lines (redacted):"
+        echo "${logs:-(journal not available)}"
+    )"
+    warn "watchdog: ${#problems[@]} problem(s): $(IFS='; '; echo "${problems[*]}")"
+    ALERT_KIND="watchdog"
+    ALERT_BODY="$body"
+    export ALERT_KIND ALERT_BODY
+    echo '[]' > "$TMPD/watchdog.json"
+    notify_all "$TMPD/watchdog.json" "" "[WATCHDOG ALERT] abuse-checker on $HOST_LABEL crashed and was recovered"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 setup_tmp() {
@@ -1164,6 +1558,19 @@ Secrets & maintenance (root):
   --edit-secrets        Decrypt to RAM (/dev/shm), open \$EDITOR, validate, re-encrypt
   --encrypt-secrets     Migrate plain-text secrets.conf into the encrypted store
   --set-secret KEY      Set one variable; the value is read from stdin
+IP pool (root):
+  --list-ips, --ips     Numbered list of ips.txt with status from state.json
+  --add-ip IP|CIDR [...] [--comment TEXT]
+                        Validate and append entries (duplicates are skipped)
+  --del-ip, --rm-ip IP|CIDR [...]
+                        Remove entries from ips.txt and their state
+  --edit-ips            Edit ips.txt in \$EDITOR with validation on save
+
+Scheduling & recovery (root):
+  --schedule SPEC       "06:00,18:00" | hourly | 6h | "every 12h" | daily |
+                        raw OnCalendar | show | reset
+  --watchdog-recover    Repair failed service/stale lock/inactive timer and alert
+
   --check-update        Compare the installed version with GitHub ($DEFAULT_REPO_SLUG)
   --update, --self-update [--force]
                         Download, verify (bash -n) and install the latest version
@@ -1196,6 +1603,15 @@ main() {
             --update|--self-update) MODE="update" ;;
             --force) extra="force" ;;
             --auto-update) MODE="auto-update" ;;
+            --list-ips|--ips) MODE="list-ips" ;;
+            --add-ip) MODE="add-ip"
+                while (( $# )) && [[ "$1" != --* ]]; do IP_ARGS+=("$1"); shift; done ;;
+            --del-ip|--rm-ip) MODE="del-ip"
+                while (( $# )) && [[ "$1" != --* ]]; do IP_ARGS+=("$1"); shift; done ;;
+            --comment) IP_COMMENT="${1?--comment needs text}"; shift ;;
+            --edit-ips) MODE="edit-ips" ;;
+            --schedule) MODE="schedule"; extra="${1:-show}"; (( $# )) && shift ;;
+            --watchdog-recover) MODE="watchdog" ;;
             -h|--help) usage; exit 0 ;;
             -V|--version) echo "$AC_VERSION"; exit 0 ;;
             *) usage >&2; exit 2 ;;
@@ -1209,6 +1625,11 @@ main() {
         set-secret) cmd_set_secret "$extra"; return ;;
         uninstall) cmd_uninstall "$extra"; return ;;
         refresh-unit) write_dropin; return ;;
+        list-ips) cmd_list_ips; return ;;
+        add-ip) cmd_add_ip "$IP_COMMENT" "${IP_ARGS[@]}"; return ;;
+        del-ip) cmd_del_ip "${IP_ARGS[@]}"; return ;;
+        edit-ips) cmd_edit_ips; return ;;
+        schedule) cmd_schedule "$extra"; return ;;
     esac
     load_config
     install_redaction
@@ -1220,6 +1641,7 @@ main() {
     esac
     setup_tmp
     case "$MODE" in
+        watchdog) cmd_watchdog_recover ;;
         run) cmd_run ;;
         test-notify) cmd_test_notify ;;
         status) cmd_status ;;

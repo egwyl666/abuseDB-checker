@@ -84,7 +84,7 @@ report_file() { echo "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date '+%Y-%m-%d'
 
 # ---------------------------------------------------------------------------
 section "Static checks"
-for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh \
+for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh tests/mock_systemctl.sh tests/mock_journalctl.sh \
          connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh connectors/99-custom.sh.example; do
     if bash -n "$ROOT/$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; fi
     if command -v shellcheck >/dev/null 2>&1; then
@@ -548,6 +548,194 @@ printf 'JIRA_URL="https://jira.test"\nJIRA_API_TOKEN="%s"\nJIRA_PROJECT_KEY="SEC
 run_checker --test-notify
 check "--test-notify creates a Jira issue" grep -q "^POST /rest/api/2/issue$" "$MOCK_LOG/jira.log"
 check "--test-notify Jira summary marked TEST" jq -se 'map(select(.fields)) | .[0].fields.summary | startswith("[TEST]")' "$MOCK_LOG/jira_payloads.log"
+
+# ---------------------------------------------------------------------------
+section "Jira connector with JIRA_BASE_URL / JIRA_USER_EMAIL"
+setup_env
+J2_TOKEN="dummyJiraTokenNewNames0987654321zz"
+printf 'JIRA_BASE_URL="https://jira.test"\nJIRA_USER_EMAIL="ops@example.test"\nJIRA_API_TOKEN="%s"\nJIRA_PROJECT_KEY="OPS"\nJIRA_ISSUE_TYPE="Incident"\n' "$J2_TOKEN" >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "jira (new names): issue created via POST /rest/api/2/issue" grep -q "^POST /rest/api/2/issue$" "$MOCK_LOG/jira.log"
+check "jira (new names): project + issue type" jq -se 'map(select(.fields))[0].fields | .project.key == "OPS" and .issuetype.name == "Incident"' "$MOCK_LOG/jira_payloads.log"
+check "jira (new names): summary table in description" jq -se 'map(select(.fields))[0].fields.description | contains("||Status||IP / Subnet||") and contains("{{192.0.2.2}}")' "$MOCK_LOG/jira_payloads.log"
+check "jira (new names): report attached (X-Atlassian-Token)" bash -c 'grep -q "^attach /rest/api/2/issue/SEC-42/attachments" "$1" && grep -q "X-Atlassian-Token: no-check" "$2"' _ "$MOCK_LOG/jira.log" "$MOCK_LOG/config.log"
+check "jira (new names): attachment is the HTML report" grep -q "form = \"file=@$(report_file);type=text/html\"" "$MOCK_LOG/config.log"
+check "jira (new names): Basic auth from JIRA_USER_EMAIL" grep -qxF "Basic $(printf '%s' "ops@example.test:$J2_TOKEN" | base64 -w0)" "$MOCK_LOG/jira_authvalues.log"
+check "jira (new names): token never in argv" bash -c '! grep -qF "$1" "$2"' _ "$J2_TOKEN" "$MOCK_LOG/argv.log"
+check "jira (new names): token redacted in output" bash -c '! grep -qF "$1" <<< "$2"' _ "$J2_TOKEN" "$OUT"
+
+# ---------------------------------------------------------------------------
+section "IP pool management (--add-ip / --del-ip / --list-ips / --edit-ips)"
+setup_env
+IPF="$ABUSE_CHECKER_CONF_DIR/ips.txt"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run        # gives 192.0.2.2 DIRTY, 192.0.2.1 CLEAN in state.json
+cmd() { OUT="$(bash "$SCRIPT" "$@" 2>&1)"; RC=$?; }
+chmod 0644 "$IPF"
+cmd --add-ip 198.51.100.7 2001:db8::5 203.0.113.0/28 --comment "web tier"
+check "--add-ip: rc 0" test "$RC" -eq 0
+check "--add-ip: IPv4 added with comment" grep -qE '^198\.51\.100\.7 +# web tier$' "$IPF"
+check "--add-ip: IPv6 added" grep -qE '^2001:db8::5 +# web tier$' "$IPF"
+check "--add-ip: CIDR added" grep -qE '^203\.0\.113\.0/28 +# web tier$' "$IPF"
+check "--add-ip: reports count" grep -q "3 entries added" <<< "$OUT"
+check "--add-ip: keeps mode 0644" test "$(stat -c %a "$IPF")" = "644"
+cp "$IPF" "$WORK/ips.before"
+cmd --add-ip 192.0.2.2 2001:DB8::5
+check "--add-ip: duplicate IPv4 skipped" grep -q "skip: 192.0.2.2 is already in" <<< "$OUT"
+check "--add-ip: duplicate IPv6 (case-insensitive) skipped" grep -q "skip: 2001:DB8::5 is already in" <<< "$OUT"
+check "--add-ip: duplicates leave file unchanged" cmp -s "$IPF" "$WORK/ips.before"
+cmd --add-ip 10.0.0.1 999.1.1.1 1.2.3.4/33 2001:db8:::1 hello 2001:db8::/129
+check "--add-ip: invalid input -> rc!=0" test "$RC" -ne 0
+for bad in 999.1.1.1 1.2.3.4/33 2001:db8:::1 hello 2001:db8::/129; do
+    check "--add-ip: rejects $bad" grep -qF "error: invalid IP/CIDR: $bad" <<< "$OUT"
+done
+check "--add-ip: all-or-nothing (valid 10.0.0.1 not added)" cmp -s "$IPF" "$WORK/ips.before"
+cmd --add-ip ::ffff:192.0.2.9 fe80::1 2001:db8:0:0:0:0:0:1
+check "--add-ip: accepts compressed/embedded IPv6 forms" bash -c '[[ $1 -eq 0 ]] && grep -q "^::ffff:192.0.2.9" "$2" && grep -q "^fe80::1" "$2"' _ "$RC" "$IPF"
+
+cmd --list-ips
+check "--list-ips: header" grep -qE '^# +IP / SUBNET +STATUS +COMMENT' <<< "$OUT"
+check "--list-ips: DIRTY with score" grep -qE '^[0-9]+ +192\.0\.2\.2 +DIRTY \(55%\)' <<< "$OUT"
+check "--list-ips: CLEAN" grep -qE '^[0-9]+ +192\.0\.2\.1 +CLEAN +clean' <<< "$OUT"
+check "--list-ips: UNCHECKED new entry + comment" grep -qE '^[0-9]+ +198\.51\.100\.7 +UNCHECKED +web tier' <<< "$OUT"
+check "--list-ips: flags invalid line" grep -qE '^[0-9]+ +not-an-ip +INVALID' <<< "$OUT"
+check "--list-ips: numbered from 1" grep -qE '^1 +192\.0\.2\.1 ' <<< "$OUT"
+cmd --ips
+check "--ips alias works" grep -q "192.0.2.2" <<< "$OUT"
+
+check "state has 192.0.2.2 before delete" jq -e '.ips["192.0.2.2"]' "$ABUSE_CHECKER_STATE_DIR/state.json"
+cmd --del-ip 192.0.2.2 198.51.100.0/24 192.0.2.250
+check "--del-ip: rc 0 when something removed" test "$RC" -eq 0
+check "--del-ip: removed from ips.txt" bash -c '! grep -qE "^192\.0\.2\.2( |$)" "$1" && ! grep -q "^198.51.100.0/24" "$1"' _ "$IPF"
+check "--del-ip: other entries kept" grep -q "^192.0.2.1" "$IPF"
+check "--del-ip: removed from state.json" jq -e '(.ips | has("192.0.2.2") or has("198.51.100.0/24")) | not' "$ABUSE_CHECKER_STATE_DIR/state.json"
+check "--del-ip: other state kept" jq -e '.ips | has("192.0.2.1")' "$ABUSE_CHECKER_STATE_DIR/state.json"
+check "--del-ip: reports not found" grep -q "not found: 192.0.2.250" <<< "$OUT"
+check "--del-ip: keeps mode 0644" test "$(stat -c %a "$IPF")" = "644"
+cmd --rm-ip 2001:DB8::5
+check "--rm-ip alias (case-insensitive IPv6)" bash -c '[[ $1 -eq 0 ]] && ! grep -q "^2001:db8::5" "$2"' _ "$RC" "$IPF"
+cmd --del-ip 192.0.2.250
+check "--del-ip: nothing matched -> rc!=0" test "$RC" -ne 0
+
+printf '#!/usr/bin/env bash\necho "192.0.2.77   # added in editor" >> "$1"\n' > "$WORK/ipedit_ok.sh"; chmod +x "$WORK/ipedit_ok.sh"
+EDITOR="$WORK/ipedit_ok.sh" cmd --edit-ips
+check "--edit-ips: valid edit saved" bash -c '[[ $1 -eq 0 ]] && grep -q "^192.0.2.77 " "$2"' _ "$RC" "$IPF"
+check "--edit-ips: pre-existing invalid line noted, not blocking" grep -q "existing invalid entries.*not-an-ip" <<< "$OUT"
+check "--edit-ips: keeps mode 0644" test "$(stat -c %a "$IPF")" = "644"
+cp "$IPF" "$WORK/ips.before"
+printf '#!/usr/bin/env bash\necho "300.1.1.1" >> "$1"\n' > "$WORK/ipedit_bad.sh"; chmod +x "$WORK/ipedit_bad.sh"
+EDITOR="$WORK/ipedit_bad.sh" cmd --edit-ips </dev/null
+check "--edit-ips: warns about invalid entry" grep -q "line [0-9]*: 300.1.1.1" <<< "$OUT"
+check "--edit-ips: invalid edit not saved without confirmation" bash -c '[[ $1 -ne 0 ]] && cmp -s "$2" "$3"' _ "$RC" "$IPF" "$WORK/ips.before"
+check "--edit-ips: temp copy removed" test -z "$(ls -A "$TMPDIR")"
+
+# ---------------------------------------------------------------------------
+section "Scheduling (--schedule)"
+setup_env
+export ABUSE_CHECKER_TIMER_DROPIN_DIR="$WORK/env/timer.d" ABUSE_CHECKER_SYSTEMCTL="$HERE/mock_systemctl.sh"
+OVR="$ABUSE_CHECKER_TIMER_DROPIN_DIR/override.conf"
+cals() { sed -n 's/^OnCalendar=//p' "$OVR" | paste -sd'|' -; }
+cmd --schedule "06:00,18:00"
+check "schedule times: rc 0" test "$RC" -eq 0
+check "schedule times: clears default OnCalendar first" bash -c 'grep -n "^OnCalendar=" "$1" | head -1 | grep -qx "[0-9]*:OnCalendar="' _ "$OVR"
+check "schedule times: two OnCalendar entries" test "$(cals)" = "|*-*-* 06:00:00|*-*-* 18:00:00"
+check "schedule: [Timer] section" grep -qx "\[Timer\]" "$OVR"
+check "schedule: daemon-reload + restart timer" bash -c 'grep -qx daemon-reload "$1" && grep -qx "restart abuse-checker.timer" "$1"' _ "$MOCK_LOG/systemctl.log"
+check "schedule: prints next trigger" grep -q "Timer next trigger:" <<< "$OUT"
+cmd --schedule "7:05, 22:30"
+check "schedule: pads and trims times" test "$(cals)" = "|*-*-* 07:05:00|*-*-* 22:30:00"
+cmd --schedule "every 6h";  check "schedule 'every 6h'" test "$(cals)" = "|*-*-* 00/6:00:00"
+cmd --schedule 6h;          check "schedule '6h'" test "$(cals)" = "|*-*-* 00/6:00:00"
+cmd --schedule "every 12h"; check "schedule 'every 12h'" test "$(cals)" = "|*-*-* 00/12:00:00"
+cmd --schedule hourly;      check "schedule 'hourly'" test "$(cals)" = "|hourly"
+cmd --schedule daily;       check "schedule 'daily'" test "$(cals)" = "|*-*-* 06:00:00"
+cmd --schedule "2x/day";    check "schedule '2x/day'" test "$(cals)" = "|*-*-* 06:00:00|*-*-* 18:00:00"
+cp "$OVR" "$WORK/ovr.before"
+cmd --schedule 7h
+check "schedule '7h' rejected (must divide 24)" bash -c '[[ $1 -ne 0 ]] && grep -q "must divide 24" <<< "$2" && cmp -s "$3" "$4"' _ "$RC" "$OUT" "$OVR" "$WORK/ovr.before"
+cmd --schedule "25:00"
+check "schedule '25:00' rejected" bash -c '[[ $1 -ne 0 ]] && cmp -s "$2" "$3"' _ "$RC" "$OVR" "$WORK/ovr.before"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    cmd --schedule "Mon..Fri *-*-* 09:15:00"
+    check "schedule raw OnCalendar accepted" test "$(cals)" = "|Mon..Fri *-*-* 09:15:00"
+    check "schedule prints next elapse from systemd-analyze" grep -q "next:" <<< "$OUT"
+    cp "$OVR" "$WORK/ovr.before"
+    cmd --schedule "every blue moon"
+    check "schedule invalid raw rejected by systemd-analyze" bash -c '[[ $1 -ne 0 ]] && grep -q "invalid OnCalendar" <<< "$2" && cmp -s "$3" "$4"' _ "$RC" "$OUT" "$OVR" "$WORK/ovr.before"
+else
+    printf '  SKIP raw OnCalendar validation (systemd-analyze unavailable)\n'
+fi
+cmd --schedule show
+check "schedule show: custom + current entry" bash -c 'grep -q "custom:" <<< "$1" && grep -q "Mon..Fri\|06:00" <<< "$1"' _ "$OUT"
+cmd --schedule reset
+check "schedule reset removes override" test ! -e "$OVR"
+cmd --schedule show
+check "schedule show after reset: default" grep -q "(default)" <<< "$OUT"
+check "unit test: schedule_to_calendars" bash -c 'source "$1"; [[ "$(schedule_to_calendars "06:00,14:00,22:00" | paste -sd"|" -)" == "*-*-* 06:00:00|*-*-* 14:00:00|*-*-* 22:00:00" ]]' _ "$SCRIPT"
+unset ABUSE_CHECKER_TIMER_DROPIN_DIR
+
+# ---------------------------------------------------------------------------
+section "Watchdog (--watchdog-recover) and unit hardening"
+setup_env
+export ABUSE_CHECKER_SYSTEMCTL="$HERE/mock_systemctl.sh" ABUSE_CHECKER_JOURNALCTL="$HERE/mock_journalctl.sh"
+printf 'JIRA_BASE_URL="https://jira.test"\nJIRA_API_TOKEN="dummyJiraWatchdogToken123456"\nJIRA_PROJECT_KEY="SEC"\nJIRA_WATCHDOG_PRIORITY="Highest"\n' >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+: > "$MOCK_LOG/notify.log"; : > "$MOCK_LOG/systemctl.log"; : > "$MOCK_LOG/jira.log"
+run_checker --watchdog-recover
+check "watchdog healthy: rc 0" test "$RC" -eq 0
+check "watchdog healthy: says healthy" grep -q "watchdog: healthy" <<< "$OUT"
+check "watchdog healthy: no alert" test ! -s "$MOCK_LOG/notify.log"
+
+LOCK="$ABUSE_CHECKER_STATE_DIR/.lock"
+: > "$LOCK"; touch -d '1 hour ago' "$LOCK"
+: > "$MOCK_LOG/config.log"; : > "$MOCK_LOG/slack_payload.log"; : > "$MOCK_LOG/jira_payloads.log"
+MOCK_SC_FAILED=1 MOCK_SC_TIMER_INACTIVE=1 MOCK_LEAK_TOKEN="$TG_TOKEN" run_checker --watchdog-recover
+check "watchdog: rc 0" test "$RC" -eq 0
+check "watchdog: stale lock removed" test ! -e "$LOCK"
+check "watchdog: reset-failed on service" grep -qx "reset-failed abuse-checker.service" "$MOCK_LOG/systemctl.log"
+check "watchdog: timer restarted" grep -qx "restart abuse-checker.timer" "$MOCK_LOG/systemctl.log"
+check "watchdog: read last 15 journal lines" grep -qx -- "-u abuse-checker.service -n 15 --no-pager -o short-iso" "$MOCK_LOG/journalctl.log"
+check "watchdog: Telegram [WATCHDOG ALERT]" grep -q 'text=🚨 <b>\[WATCHDOG ALERT\] abuse-checker on testhost crashed and was recovered</b>' "$MOCK_LOG/config.log"
+check "watchdog: alert lists problems and actions" bash -c 'grep -q "failed state" "$1" && grep -q "removed stale lock" "$1" && grep -q "restarted abuse-checker.timer" "$1"' _ "$MOCK_LOG/config.log"
+check "watchdog: alert includes journal lines" grep -q "line 19" "$MOCK_LOG/config.log"
+check "watchdog: journal secret redacted in alert" bash -c 'l="$(grep "failed to connect" "$1")"; [[ -n "$l" ]] && ! grep -qF "$2" <<< "$l" && grep -q "bot\*\*\*REDACTED\*\*\*/sendMessage" <<< "$l"' _ "$MOCK_LOG/config.log" "$TG_TOKEN"
+check "watchdog: no report document sent" bash -c '! grep -q sendDocument "$1"' _ "$MOCK_LOG/notify.log"
+check "watchdog: Slack alert" grep -q "rotating_light" "$MOCK_LOG/slack_payload.log"
+check "watchdog: email high priority + body" bash -c 'grep -q "X-Priority: 1" "$1" && grep -q "Subject: \[WATCHDOG ALERT\]" "$1" && grep -q "Last 15 log lines" "$1"' _ "$MOCK_LOG/mail.log"
+check "watchdog: Jira issue with watchdog label + priority" jq -se 'map(select(.fields))[0].fields | (.labels | index("abuse-checker-watchdog")) and .priority.name == "Highest" and (.summary | startswith("[WATCHDOG ALERT]"))' "$MOCK_LOG/jira_payloads.log"
+check "watchdog: Jira always creates (no search)" bash -c '! grep -q search "$1"' _ "$MOCK_LOG/jira.log"
+
+: > "$MOCK_LOG/systemctl.log"
+MOCK_SC_TIMER_DISABLED=1 run_checker --watchdog-recover
+check "watchdog: re-enables disabled timer" grep -qx "enable abuse-checker.timer" "$MOCK_LOG/systemctl.log"
+
+: > "$LOCK"; touch -d '1 hour ago' "$LOCK"
+flock "$LOCK" sleep 5 & HOLDER=$!; sleep 0.3
+: > "$MOCK_LOG/notify.log"
+run_checker --watchdog-recover
+check "watchdog: held lock is left alone" bash -c '[[ -e "$1" ]] && grep -q "run is in progress" <<< "$2"' _ "$LOCK" "$OUT"
+check "watchdog: held lock alone is not an alert" test ! -s "$MOCK_LOG/notify.log"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+jq '.lastRun = "2026-01-01T00:00:00Z"' "$ABUSE_CHECKER_STATE_DIR/state.json" > "$WORK/st" && cp "$WORK/st" "$ABUSE_CHECKER_STATE_DIR/state.json"
+run_checker --watchdog-recover
+check "watchdog: stale lastRun triggers alert" grep -q "no successful run for" <<< "$OUT"
+unset ABUSE_CHECKER_SYSTEMCTL ABUSE_CHECKER_JOURNALCTL
+
+U="$ROOT/systemd/abuse-checker.service"
+for kv in "Restart=on-failure" "RestartSec=60s" "RuntimeMaxSec=15min" "TimeoutStartSec=15min" \
+          "StartLimitIntervalSec=15min" "StartLimitBurst=3" "OnFailure=abuse-checker-watchdog.service"; do
+    check "unit: $kv" grep -qx "$kv" "$U"
+done
+check "unit: StartLimit* in [Unit] section" bash -c 'awk "/^\[Service\]/{exit} /^StartLimitBurst=3/{f=1} END{exit !f}" "$1"' _ "$U"
+check "watchdog unit runs --watchdog-recover" grep -qx "ExecStart=/usr/local/bin/abuse-checker --watchdog-recover" "$ROOT/systemd/abuse-checker-watchdog.service"
+check "watchdog timer is periodic" grep -q "^OnUnitActiveSec=" "$ROOT/systemd/abuse-checker-watchdog.timer"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    check "units pass systemd-analyze verify" bash -c 'SYSTEMD_LOG_LEVEL=err systemd-analyze verify --man=no "$@" 2>&1 | grep -v "not executable" | grep -q . && exit 1 || exit 0' _ \
+        "$ROOT/systemd/abuse-checker.service" "$ROOT/systemd/abuse-checker.timer" "$ROOT/systemd/abuse-checker-watchdog.service" "$ROOT/systemd/abuse-checker-watchdog.timer"
+fi
 
 # ---------------------------------------------------------------------------
 section "Self-update: --check-update / --update / AUTO_UPDATE"

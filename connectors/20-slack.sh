@@ -13,21 +13,29 @@ connector_enabled() { [[ -n "${SLACK_WEBHOOK_URLS:-}" ]]; }
 connector_send() {
     local data="$1" report="$2" title="$3" payload url n=0 i=0
     payload="$TMPD/slack.json"
-    jq --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --arg report "$(basename "$report")" --argjson force "$FORCE_FULL" '
-        [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
-        | {text:$title, blocks:(
-            [{type:"header", text:{type:"plain_text", text:$title[:150]}},
-             {type:"section", fields:[
-                {type:"mrkdwn", text:"*Checked:* \(length)"},
-                {type:"mrkdwn", text:"*Clean:* \(map(select(.status=="CLEAN"))|length)"},
-                {type:"mrkdwn", text:":red_circle: *New:* \(map(select(.status=="NEW"))|length)"},
-                {type:"mrkdwn", text:":large_orange_circle: *Escalated:* \(map(select(.status=="ESCALATED"))|length)"}]},
-             {type:"divider"}]
-            + [$a[:20][] | {type:"section",
-                text:{type:"mrkdwn", text:("*\(.status)* `\(.target)` — score *\(.score)%*, \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n_\(.isp)_ \(.country // "")" else "" end))},
-                accessory:{type:"button", text:{type:"plain_text", text:"AbuseIPDB"}, url:"https://www.abuseipdb.com/check/\(.target|@uri)"}}]
-            + [{type:"context", elements:[{type:"mrkdwn", text:("\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted · full report: \($report)" + (if $upd != "" then "\n:arrow_up: \($upd)" else "" end))}]}])}' "$data" > "$payload" \
-        || { warn "Slack: failed to build payload"; return 1; }
+    if [[ -n "${ALERT_BODY:-}" ]]; then
+        jq -n --arg title "$title" --arg b "${ALERT_BODY:0:2900}" '
+            {text:$title, blocks:[
+                {type:"header", text:{type:"plain_text", text:(":rotating_light: " + $title)[:150]}},
+                {type:"section", text:{type:"mrkdwn", text:("```" + $b + "```")}}]}' > "$payload" \
+            || { warn "Slack: failed to build payload"; return 1; }
+    else
+        jq --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --arg report "$(basename "$report")" --argjson force "$FORCE_FULL" '
+            [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
+            | {text:$title, blocks:(
+                [{type:"header", text:{type:"plain_text", text:$title[:150]}},
+                 {type:"section", fields:[
+                    {type:"mrkdwn", text:"*Checked:* \(length)"},
+                    {type:"mrkdwn", text:"*Clean:* \(map(select(.status=="CLEAN"))|length)"},
+                    {type:"mrkdwn", text:":red_circle: *New:* \(map(select(.status=="NEW"))|length)"},
+                    {type:"mrkdwn", text:":large_orange_circle: *Escalated:* \(map(select(.status=="ESCALATED"))|length)"}]},
+                 {type:"divider"}]
+                + [$a[:20][] | {type:"section",
+                    text:{type:"mrkdwn", text:("*\(.status)* `\(.target)` — score *\(.score)%*, \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n_\(.isp)_ \(.country // "")" else "" end))},
+                    accessory:{type:"button", text:{type:"plain_text", text:"AbuseIPDB"}, url:"https://www.abuseipdb.com/check/\(.target|@uri)"}}]
+                + [{type:"context", elements:[{type:"mrkdwn", text:("\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted · full report: \($report)" + (if $upd != "" then "\n:arrow_up: \($upd)" else "" end))}]}])}' "$data" > "$payload" \
+            || { warn "Slack: failed to build payload"; return 1; }
+    fi
     while IFS= read -r url; do
         i=$((i+1))
         if secure_curl "$(cfg_line url "$url")

@@ -28,6 +28,9 @@ respond() { # code body [remaining]
     return 0
 }
 
+up="$(sed -n 's/^upload-file = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"
+[[ -n "$up" && -f "$up" ]] && cat "$up" >> "$MOCK_LOG/mail.log"
+
 case "$url" in
     https://jira.test*)          # Jira REST API emulation
         method="$(sed -n 's/^request = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"

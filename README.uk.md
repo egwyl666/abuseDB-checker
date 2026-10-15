@@ -31,6 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/insta
 - [Керування IP-адресами та отримувачами](#керування-ip-адресами-та-отримувачами)
 - [Довідка CLI](#довідка-cli)
 - [Щоденне обслуговування](#щоденне-обслуговування)
+- [Розклад](#розклад)
+- [Watchdog і автовідновлення](#watchdog-і-автовідновлення)
 - [Оновлення](#оновлення)
 - [Видалення](#видалення)
 - [Модель безпеки](#модель-безпеки)
@@ -113,6 +115,9 @@ curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/insta
 | `/etc/systemd/system/abuse-checker.service`            | `0644` | `root:root`                 | Ізольований oneshot-сервіс                         |
 | `/etc/systemd/system/abuse-checker.service.d/10-secrets.conf` | `0644` | `root:root`          | Генерується: як systemd передає секрети сервісу    |
 | `/etc/systemd/system/abuse-checker.timer`              | `0644` | `root:root`                 | Щоденний запуск (06:00 + до 15 хв випадково)       |
+| `/etc/systemd/system/abuse-checker.timer.d/override.conf` | `0644` | `root:root`              | Власний розклад, записаний через `--schedule`      |
+| `/etc/systemd/system/abuse-checker-watchdog.service`   | `0644` | `root:root`                 | Відновлення + сповіщення про збій (`--watchdog-recover`) |
+| `/etc/systemd/system/abuse-checker-watchdog.timer`     | `0644` | `root:root`                 | Періодична перевірка watchdog (кожні 6 год)        |
 | `/usr/local/share/doc/abuse-checker/`                  | `0755` | `root:root`                 | Файли README                                       |
 
 Одночасно існує лише один із файлів `secrets.cred`, `secrets.conf.enc` або
@@ -244,6 +249,7 @@ journalctl -u abuse-checker -n 50 --no-pager
 | `REQUEST_DELAY`       | `0`             | Пауза в секундах між запитами до API                                |
 | `RETENTION_DAYS`      | `30`            | Видаляти звіти, старші за цю кількість днів                         |
 | `HOST_LABEL`          | ім'я хоста      | Назва, що показується в сповіщеннях і звітах                        |
+| `WATCHDOG_MAX_AGE_HOURS` | `48`         | Watchdog надсилає сповіщення, якщо останній успішний запуск давніший за цей час |
 | `AUTO_UPDATE`         | `notify`        | `notify`, `true` (автовстановлення) або `false`; див. [Оновлення](#оновлення) |
 | `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Джерело для `--check-update` і `--update`          |
 | `TELEGRAM_BOT_TOKEN`  | –               | Токен бота від @BotFather                                           |
@@ -253,14 +259,18 @@ journalctl -u abuse-checker -n 50 --no-pager
 | `EMAIL_FROM`          | `abuse-checker@<host>` | Адреса відправника                                           |
 | `SMTP_URL`            | –               | `smtps://host:465` або `smtp://host:587` (STARTTLS обов'язковий)    |
 | `SMTP_USER`/`SMTP_PASS` | –             | Облікові дані SMTP. Без `SMTP_URL` використовується локальний `sendmail -t` |
-| `JIRA_URL`            | –               | Базовий URL Jira, наприклад `https://your-org.atlassian.net`        |
-| `JIRA_EMAIL`          | –               | E-mail облікового запису Jira Cloud (Basic auth). Порожньо = PAT для Server/DC (Bearer) |
+| `JIRA_BASE_URL`            | –               | Базовий URL Jira, наприклад `https://company.atlassian.net`        |
+| `JIRA_USER_EMAIL`          | –               | E-mail облікового запису Jira Cloud (Basic auth). Порожньо = PAT для Server/DC (Bearer) |
 | `JIRA_API_TOKEN`      | –               | API-токен Cloud або персональний токен доступу Server/DC            |
 | `JIRA_PROJECT_KEY`    | –               | Проєкт для задач, наприклад `SEC`                                   |
 | `JIRA_ISSUE_TYPE`     | `Task`          | Назва типу задачі, наприклад `Bug`, `Incident`                      |
 | `JIRA_UPDATE_MODE`    | `comment`       | `comment`: оновити відкриту задачу для цього хоста; `create`: щоразу створювати нову |
 | `JIRA_LABELS` / `JIRA_PRIORITY` | –     | Додаткові мітки (через кому) та назва пріоритету                    |
 | `JIRA_ATTACH_REPORT`  | `true`          | Прикріпити HTML-звіт до задачі                                      |
+| `JIRA_WATCHDOG_PRIORITY` | –            | Пріоритет задач `[WATCHDOG ALERT]`, наприклад `Highest`             |
+
+Старі назви `JIRA_URL` і `JIRA_EMAIL` і далі приймаються як синоніми
+`JIRA_BASE_URL` і `JIRA_USER_EMAIL`.
 
 Безкоштовні тарифи AbuseIPDB дозволяють `check-block` лише для мереж до `/24`.
 Більші блоки розділіть або використайте `USE_CHECK_BLOCK=false` з меншим
@@ -271,6 +281,48 @@ journalctl -u abuse-checker -n 50 --no-pager
 ## Керування IP-адресами та отримувачами
 
 ### IP-адреси та підмережі
+
+Керуйте списком із командного рядка. Кожна зміна перевіряється й
+записується атомарно, а `ips.txt` зберігає права `0644 root:abusechecker`.
+
+```bash
+sudo abuse-checker --add-ip 203.0.113.10 2001:db8::1 198.51.100.0/28 --comment "web tier"
+sudo abuse-checker --list-ips            # синонім: --ips
+sudo abuse-checker --del-ip 203.0.113.10 # синонім: --rm-ip; також видаляє запис зі state.json
+sudo abuse-checker --edit-ips            # $EDITOR на тимчасовій копії, перевірка при збереженні
+```
+
+```
+#    IP / SUBNET                  STATUS             COMMENT
+1    203.0.113.10                 DIRTY (87%)        web tier
+2    2001:db8::1                  CLEAN              web tier
+3    198.51.100.0/28              UNCHECKED          web tier
+4    not-an-ip                    INVALID
+
+4 entries in /etc/abuse-checker/ips.txt
+```
+
+Як працює кожна команда:
+
+- **`--add-ip`** перевіряє кожен аргумент як IPv4, IPv6 (зокрема зі
+  скороченням `::` і формою `::ffff:a.b.c.d`) або CIDR (`/0-32`, `/0-128`).
+  Якщо хоча б один аргумент некоректний, вона **нічого не додає**, завершується
+  з ненульовим кодом і називає кожне хибне значення. Записи, які вже є у
+  файлі (IPv6 порівнюються без урахування регістру), пропускаються з
+  повідомленням. `--comment` додає однаковий коментар до кожного нового
+  рядка.
+- **`--del-ip`** видаляє відповідні рядки й одразу прибирає ці записи зі
+  `state.json`, тож застарілого стану не лишається. Якщо нічого не знайдено,
+  завершується з ненульовим кодом.
+- **`--list-ips`** показує стан кожного запису після останнього запуску:
+  `CLEAN`, `DIRTY (оцінка%)`, `UNCHECKED` для ще не перевірених записів або
+  `INVALID`.
+- **`--edit-ips`** відкриває тимчасову копію. Під час збереження показує
+  некоректні записи й пропонує відредагувати знову, зберегти попри це або
+  скасувати. Некоректні записи, які вже були у файлі, лише згадуються. Без
+  терміналу нові некоректні записи ніколи не зберігаються.
+
+Файл, як і раніше, можна редагувати вручну:
 
 ```bash
 sudo editor /etc/abuse-checker/ips.txt
@@ -335,16 +387,16 @@ sudo abuse-checker --test-notify
    встановіть `JIRA_ATTACH_REPORT="false"`).
 
 Коли задачу вирішено і її статус належить до категорії Done, наступне
-сповіщення створить нову задачу. У Jira Cloud задайте `JIRA_EMAIL` і
+сповіщення створить нову задачу. У Jira Cloud задайте `JIRA_USER_EMAIL` і
 [API-токен](https://id.atlassian.com/manage-profile/security/api-tokens);
 конектор надсилає їх як HTTP Basic auth. У Server/Data Center залиште
-`JIRA_EMAIL` порожнім і вкажіть персональний токен доступу в
+`JIRA_USER_EMAIL` порожнім і вкажіть персональний токен доступу в
 `JIRA_API_TOKEN`; він надсилається як Bearer-токен. В обох випадках токен і
 похідний заголовок `Authorization` потрапляють у curl лише через
 `--config -` (stdin), а сам токен маскується в логах.
 
 ```bash
-sudo abuse-checker --edit-secrets   # JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
+sudo abuse-checker --edit-secrets   # JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
 sudo abuse-checker --test-notify    # створює задачу "[TEST] ..."
 ```
 
@@ -405,7 +457,7 @@ printf '%s\n' "$VALUE" | sudo abuse-checker --set-secret SLACK_WEBHOOK_URLS   # 
 | `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
 | `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
 | `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
-| `40-jira.sh` | `JIRA_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (обов'язкові), а також `JIRA_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
+| `40-jira.sh` | `JIRA_BASE_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (обов'язкові), а також `JIRA_USER_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
 | `99-custom.sh.example` | Задокументований шаблон. Не завантажується, бо не закінчується на `.sh`. |
 
 Конектор визначає дві функції:
@@ -441,6 +493,8 @@ connector_send      # $1 = класифікований JSON, $2 = report.html, 
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
 abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
 abuse-checker [--check-update | --update [--force]]
+abuse-checker [--list-ips | --add-ip IP... [--comment T] | --del-ip IP... | --edit-ips]
+abuse-checker [--schedule SPEC|show|reset | --watchdog-recover]
 ```
 
 | Прапорець             | Дія |
@@ -454,6 +508,12 @@ abuse-checker [--check-update | --update [--force]]
 | `--edit-secrets`      | Лише root. Розшифрувати в RAM, відредагувати, перевірити, зашифрувати, знищити копію. Див. [Зашифровані секрети](#зашифровані-секрети). |
 | `--encrypt-secrets`   | Лише root. Перенести звичайний `secrets.conf` у зашифроване сховище і знищити оригінал. |
 | `--set-secret KEY`    | Лише root. Задати одну змінну, значення читається зі stdin (воно ніколи не з'являється в `ps`). |
+| `--list-ips`, `--ips` | Нумерований список `ips.txt` з коментарями та станом (`CLEAN`, `DIRTY (оцінка%)`, `UNCHECKED`, `INVALID`). |
+| `--add-ip IP\|CIDR ... [--comment ТЕКСТ]` | Лише root. Перевірити й додати записи; дублікати пропускаються, і нічого не додається, якщо хоча б одне значення некоректне. |
+| `--del-ip`, `--rm-ip IP\|CIDR ...` | Лише root. Видалити записи з `ips.txt` і зі `state.json`. |
+| `--edit-ips`          | Лише root. Редагувати `ips.txt` у `$EDITOR` з перевіркою під час збереження. |
+| `--schedule SPEC`     | Лише root. Задати час запусків (`"06:00,18:00"`, `every 6h`, `hourly`, вираз OnCalendar) або `show` / `reset`. Див. [Розклад](#розклад). |
+| `--watchdog-recover`  | Лише root. Відновити юніт у стані failed, застаріле блокування чи неактивний таймер і надіслати сповіщення. Див. [Watchdog](#watchdog-і-автовідновлення). |
 | `--check-update`      | Порівняти встановлену версію з останньою на GitHub. |
 | `--update`, `--self-update` | Лише root. Завантажити, перевірити (`bash -n`) і встановити останню версію (`--force` перевстановлює). Див. [Оновлення](#оновлення). |
 | `--uninstall`         | Лише root. Інтерактивне меню або `--keep` / `--purge` для скриптів. Див. [Видалення](#видалення). |
@@ -476,13 +536,86 @@ sudo ls -lt /var/lib/abuse-checker/reports/    # останні звіти
 sudo abuse-checker --force-full-report         # повторно надіслати повну картину
 ```
 
-Щоб змінити розклад, виконайте `sudo systemctl edit abuse-checker.timer` і
-додайте:
+Щоб змінити час запусків, див. [Розклад](#розклад).
 
-```ini
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 07:30:00
+---
+
+## Розклад
+
+Типово перевірка запускається раз на день о 06:00 з випадковою затримкою до
+15 хвилин. Щоб змінити це без редагування юнітів:
+
+```bash
+sudo abuse-checker --schedule "06:00,14:00,22:00"   # кілька фіксованих часів
+sudo abuse-checker --schedule "every 6h"            # також: 6h, 12h, hourly, daily, 2x/day
+sudo abuse-checker --schedule "Mon..Fri *-*-* 09:15:00"   # будь-який вираз OnCalendar systemd
+sudo abuse-checker --schedule show                  # поточний розклад і наступні запуски
+sudo abuse-checker --schedule reset                 # повернути щоденний запуск о 06:00
+```
+
+| Специфікація | Що записується в OnCalendar |
+|--------------|-----------------------------|
+| `06:00,18:00` | `*-*-* 06:00:00`, `*-*-* 18:00:00` |
+| `hourly` / `1h` | `hourly` |
+| `6h`, `every 6h` (також `2h 3h 4h 8h 12h`) | `*-*-* 00/6:00:00` |
+| `daily` | `*-*-* 06:00:00` |
+| `2x/day` / `4x/day` | 06:00 + 18:00 / кожні 6 год |
+| будь-що інше | використовується як є |
+
+Кожен вираз перевіряється через `systemd-analyze calendar` ще до запису, і
+некоректне введення нічого не змінює. Розклад записується в
+`/etc/systemd/system/abuse-checker.timer.d/override.conf`, який починається з
+порожнього `OnCalendar=`, щоб скинути типове значення. Потім команда виконує
+`systemctl daemon-reload && systemctl restart abuse-checker.timer` і показує
+найближчі запуски. Майстер налаштування ставить те саме запитання: раз на
+день (типово), 2 рази на день, 4 рази на день або власний час. Оновлення
+ніколи не перезаписують ваш override.
+
+---
+
+## Watchdog і автовідновлення
+
+`abuse-checker.service` відновлюється самостійно:
+
+| Налаштування | Дія |
+|--------------|-----|
+| `TimeoutStartSec=15min`, `RuntimeMaxSec=15min` | Запуск, що завис на 15 хвилин, примусово завершується. Запуск `Type=oneshot` вважається таким, що стартує, доки не завершиться, тож фактично діє ліміт `TimeoutStartSec`. |
+| `Restart=on-failure`, `RestartSec=60s` | Запуск, що впав або був примусово завершений, повторюється через 60 с. |
+| `StartLimitIntervalSec=15min`, `StartLimitBurst=3` | Не більше 3 запусків за 15 хвилин. Після цього юніт позначається як failed... |
+| `OnFailure=abuse-checker-watchdog.service` | ...і запускається watchdog. |
+
+`abuse-checker-watchdog.service` виконує `abuse-checker --watchdog-recover`
+від root. Його запускає `OnFailure=`, а також кожні 6 годин
+`abuse-checker-watchdog.timer`. Він:
+
+1. скидає стан failed для `abuse-checker.service`;
+2. видаляє `/var/lib/abuse-checker/.lock`, якщо жоден процес його не тримає
+   (утримуване блокування означає, що запуск триває, тож його не чіпають);
+3. перевіряє, що `abuse-checker.timer` увімкнено й активно, і перезапускає
+   його, якщо ні;
+4. перевіряє, що останній успішний запуск був не давніше ніж
+   `WATCHDOG_MAX_AGE_HOURS` годин тому (типово 48);
+5. якщо щось було не так, надсилає в усі налаштовані конектори сповіщення з
+   високим пріоритетом
+   **`[WATCHDOG ALERT] abuse-checker on <хост> crashed and was recovered`**.
+   Сповіщення містить список проблем, виконані дії з відновлення та останні
+   15 рядків `journalctl -u abuse-checker.service` з замаскованими
+   секретами.
+
+Як кожен конектор надсилає сповіщення watchdog:
+
+- **Telegram:** повідомлення 🚨 з логом у блоці `<pre>`.
+- **Slack:** заголовок `:rotating_light:` з логом у блоці коду.
+- **Email:** лист із заголовками `X-Priority: 1` і `Importance: high`.
+- **Jira:** завжди **нова** задача з міткою `abuse-checker-watchdog` і
+  пріоритетом `JIRA_WATCHDOG_PRIORITY`, якщо його задано.
+
+Справна система сповіщень не надсилає.
+
+```bash
+sudo abuse-checker --watchdog-recover           # запустити перевірку вручну
+systemctl list-timers abuse-checker-watchdog.timer
+journalctl -u abuse-checker-watchdog -n 30
 ```
 
 ---
@@ -665,6 +798,30 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
   сповіщення; Jira пропускається, якщо не налаштована; `--test-notify` до неї
   доходить; токен і заголовок Basic ніколи не потрапляють в argv, а токен
   маскується в логах;
+- Jira з `JIRA_BASE_URL`/`JIRA_USER_EMAIL`: `POST /rest/api/2/issue` з
+  проєктом, типом задачі й підсумковою таблицею; HTML-звіт завантажується в
+  `/attachments` із `X-Atlassian-Token: no-check`; Basic auth; токен ніколи
+  не потрапляє в argv і маскується у виводі;
+- список IP: `--add-ip` з IPv4, IPv6 (скорочені форми, вбудований IPv4) і
+  CIDR, вбудовані коментарі, збереження прав `0644`, виявлення дублікатів
+  (IPv6 без урахування регістру), відхилення за принципом «все або нічого»
+  для `999.1.1.1`, `/33`, `:::`, `hello` і `/129`; стани, коментарі та
+  нумерація в `--list-ips`; `--del-ip` і `--rm-ip` видаляють записи з
+  `ips.txt` і `state.json` та повідомляють `not found`; `--edit-ips`
+  зберігає коректні зміни, без TTY не зберігає нових некоректних записів і
+  прибирає тимчасовий файл;
+- `--schedule`: вміст drop-in для `"06:00,18:00"`, `"7:05, 22:30"`,
+  `every 6h`, `6h`, `every 12h`, `hourly`, `daily` і `2x/day`; відхилення
+  `7h`, `25:00` і некоректних довільних виразів (через `systemd-analyze`);
+  довільний OnCalendar; `daemon-reload` і перезапуск таймера; `show` і
+  `reset`;
+- watchdog: справна система не надсилає сповіщень; юніт у стані failed,
+  застаріле блокування та неактивний чи вимкнений таймер відновлюються, а
+  сповіщення надходить у Telegram, Slack, email (високий пріоритет) і Jira
+  (нова задача з міткою й пріоритетом watchdog); 15 рядків журналу
+  включаються з замаскованими секретами; утримуване блокування не
+  чіпається; застарілий `lastRun` викликає сповіщення; налаштування юнітів
+  перевіряються, і юніти проходять `systemd-analyze verify`;
 - самооновлення: `--check-update` (новіша версія, та сама, GitHub
   недоступний); `--update` зі справним релізом, пошкодженим
   `abuse-checker.sh`, пошкодженим конектором, архівом-сміттям і невдалим
@@ -692,7 +849,11 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | `RAM directory /dev/shm not available` | Змонтуйте tmpfs у `/dev/shm` або вкажіть інший каталог tmpfs у `ABUSE_CHECKER_RAMDIR`. |
 | `connector X: ... skipped` | Цей файл у `connectors.d` порожній, містить синтаксичну помилку або не має `connector_enabled`/`connector_send`. Виправте або видаліть його. |
 | `Jira issue creation failed (HTTP 400): ...` | Показується власна помилка Jira, часто неправильний `JIRA_ISSUE_TYPE` або обов'язкове поле, наприклад компонент. Виправте через `--edit-secrets` і повторіть із `--test-notify`. |
-| `Jira ... (HTTP 401/403)` | Неправильний `JIRA_EMAIL` чи токен, або обліковий запис не може створювати задачі в проєкті. У Server/DC залиште `JIRA_EMAIL` порожнім, щоб використати PAT. |
+| `Jira ... (HTTP 401/403)` | Неправильний `JIRA_USER_EMAIL` чи токен, або обліковий запис не може створювати задачі в проєкті. У Server/DC залиште `JIRA_USER_EMAIL` порожнім, щоб використати PAT. |
+| `error: invalid IP/CIDR: ...` від `--add-ip` | Нічого не додано. Виправте або приберіть вказане значення, наприклад `/33` чи `999.x`, і повторіть команду. |
+| `invalid OnCalendar expression` | Перевірте вираз через `systemd-analyze calendar '<вираз>'` або використайте одну з готових специфікацій. |
+| Надійшло `[WATCHDOG ALERT]` | Сервіс тричі впав за 15 хвилин або завис. Перегляньте рядки логу в сповіщенні та `journalctl -u abuse-checker -n 100`. Відновлення вже виконано, і наступний запуск за таймером спробує знову. |
+| `start request repeated too quickly` | Досягнуто ліміту запусків (3 за 15 хвилин). Watchdog скидає його; також можна виконати `sudo systemctl reset-failed abuse-checker`. |
 | `no connector delivered the alert` | Жоден конектор не налаштовано. Перевірте рядок `Connectors` у `--status`, потім виконайте `--edit-secrets`. |
 | `IP list not readable` | Перевірте, що `ips.txt` існує і має права `0644 root:abusechecker`. Повторний запуск `install.sh` виправить права. |
 | `state directory ... does not exist` | Виконайте `sudo ./install.sh`. |

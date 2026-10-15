@@ -71,6 +71,7 @@ for t in bash curl jq awk sed date mktemp find install openssl; do
     command -v "$t" >/dev/null 2>&1 || die "missing dependency '$t' (e.g. apt install curl jq)"
 done
 for f in abuse-checker.sh systemd/abuse-checker.service systemd/abuse-checker.timer \
+         systemd/abuse-checker-watchdog.service systemd/abuse-checker-watchdog.timer \
          config/secrets.conf.example config/ips.txt.example \
          connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh; do
     [[ -f "$SRC/$f" ]] || die "missing source file: $f"
@@ -119,6 +120,8 @@ find "$STATE_DIR/reports" -type f -exec chown "$USER_NAME:$USER_NAME" {} + -exec
 say "installing systemd units"
 install -o root -g root -m 0644 "$SRC/systemd/abuse-checker.service" "$UNIT_DIR/abuse-checker.service"
 install -o root -g root -m 0644 "$SRC/systemd/abuse-checker.timer" "$UNIT_DIR/abuse-checker.timer"
+install -o root -g root -m 0644 "$SRC/systemd/abuse-checker-watchdog.service" "$UNIT_DIR/abuse-checker-watchdog.service"
+install -o root -g root -m 0644 "$SRC/systemd/abuse-checker-watchdog.timer" "$UNIT_DIR/abuse-checker-watchdog.timer"
 
 if [[ -f "$SRC/README.md" ]]; then
     install -d -m 0755 "$DOC_DIR"
@@ -144,6 +147,7 @@ if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     if $ENABLE; then
         systemctl enable --now abuse-checker.timer
+        systemctl enable --now abuse-checker-watchdog.timer
         say "timer enabled: $(systemctl show abuse-checker.timer -p NextElapseUSecRealtime --value)"
     fi
 else
@@ -193,14 +197,25 @@ wizard() {
         fi
     fi
     echo "  5/5 Jira connector (creates/updates an issue per alert)"
-    ask v1 "Jira base URL (e.g. https://your-org.atlassian.net)"
+    ask v1 "Jira base URL (e.g. https://company.atlassian.net)"
     if [[ -n "$v1" ]]; then
-        put JIRA_URL "$v1"
+        put JIRA_BASE_URL "$v1"
         ask v2 "Project key (e.g. SEC)"; put JIRA_PROJECT_KEY "$v2"
-        ask v3 "Account e-mail (Cloud; Enter = Server/DC personal access token)"; put JIRA_EMAIL "$v3"
+        ask v3 "Account e-mail (Cloud; Enter = Server/DC personal access token)"; put JIRA_USER_EMAIL "$v3"
         ask v4 "API token" silent; put JIRA_API_TOKEN "$v4"
         ask v2 "Issue type (Enter = Task)"; put JIRA_ISSUE_TYPE "$v2"
     fi
+    echo "  Check schedule"
+    echo "    1) once a day at 06:00 (default)   2) twice a day (06:00, 18:00)"
+    echo "    3) 4x a day (every 6h)              4) custom times, e.g. 07:30,19:30"
+    read -r -u "$TTY_FD" -p "    Choose [1-4]: " v1 || v1=""
+    case "$v1" in
+        2) "$BIN" --schedule "06:00,18:00" | sed 's/^/    /' ;;
+        3) "$BIN" --schedule "every 6h" | sed 's/^/    /' ;;
+        4) read -r -u "$TTY_FD" -p "    Times (HH:MM,HH:MM,...) or OnCalendar expression: " v2 || v2=""
+           if [[ -n "$v2" ]]; then "$BIN" --schedule "$v2" | sed 's/^/    /' || echo "    ! invalid schedule; keeping daily 06:00"; fi ;;
+        *) echo "    keeping daily 06:00" ;;
+    esac
     echo "  Automatic updates from GitHub ($REPO_SLUG)"
     read -r -u "$TTY_FD" -p "    Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled] " v1 || v1=""
     case "$v1" in 2) v1=true ;; 3) v1=false ;; *) v1=notify ;; esac

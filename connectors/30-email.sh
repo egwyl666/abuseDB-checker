@@ -17,9 +17,11 @@ connector_send() {
     {
         printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMIME-Version: 1.0\r\n' \
             "$EMAIL_FROM" "$to_hdr" "$title" "$(date -R)"
+        # High priority for free-text alerts such as the watchdog.
+        [[ -z "${ALERT_BODY:-}" ]] || printf 'X-Priority: 1 (Highest)\r\nImportance: high\r\n'
         printf 'Content-Type: multipart/mixed; boundary="%s"\r\n\r\n' "$boundary"
         printf -- '--%s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n' "$boundary"
-        plain_summary "$data" "$title" | sed 's/$/\r/'
+        if [[ -n "${ALERT_BODY:-}" ]]; then printf '%s\n' "$ALERT_BODY"; else plain_summary "$data" "$title"; fi | sed 's/$/\r/'
         if [[ -f "$report" ]]; then
             printf '\r\n--%s\r\nContent-Type: text/html; charset=utf-8; name="%s"\r\n' "$boundary" "$(basename "$report")"
             printf 'Content-Disposition: attachment; filename="%s"\r\nContent-Transfer-Encoding: base64\r\n\r\n' "$(basename "$report")"

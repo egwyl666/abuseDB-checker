@@ -29,6 +29,8 @@ at once. They can also open or update a Jira issue.
 - [Managing IPs and recipients](#managing-ips-and-recipients)
 - [CLI reference](#cli-reference)
 - [Daily maintenance](#daily-maintenance)
+- [Scheduling](#scheduling)
+- [Watchdog and auto-recovery](#watchdog-and-auto-recovery)
 - [Updating](#updating)
 - [Uninstalling](#uninstalling)
 - [Security model](#security-model)
@@ -109,6 +111,9 @@ from outside (about 6–15 KB for typical pools). It contains:
 | `/etc/systemd/system/abuse-checker.service`            | `0644` | `root:root`                 | Sandboxed oneshot service                       |
 | `/etc/systemd/system/abuse-checker.service.d/10-secrets.conf` | `0644` | `root:root`          | Generated: how systemd hands secrets to the service |
 | `/etc/systemd/system/abuse-checker.timer`              | `0644` | `root:root`                 | Daily trigger (06:00 + up to 15 min jitter)     |
+| `/etc/systemd/system/abuse-checker.timer.d/override.conf` | `0644` | `root:root`              | Custom schedule written by `--schedule`         |
+| `/etc/systemd/system/abuse-checker-watchdog.service`   | `0644` | `root:root`                 | Recovery + crash alert (`--watchdog-recover`)   |
+| `/etc/systemd/system/abuse-checker-watchdog.timer`     | `0644` | `root:root`                 | Periodic watchdog check (every 6 h)             |
 | `/usr/local/share/doc/abuse-checker/`                  | `0755` | `root:root`                 | README files                                    |
 
 Only one of `secrets.cred`, `secrets.conf.enc` or `secrets.conf` exists at a
@@ -236,6 +241,7 @@ editor refuses anything else.
 | `REQUEST_DELAY`       | `0`             | Seconds to sleep between API calls                               |
 | `RETENTION_DAYS`      | `30`            | Delete reports older than this                                   |
 | `HOST_LABEL`          | hostname        | Name shown in alerts and reports                                 |
+| `WATCHDOG_MAX_AGE_HOURS` | `48`         | Watchdog alerts if the last successful run is older than this    |
 | `AUTO_UPDATE`         | `notify`        | `notify`, `true` (auto-install) or `false`; see [Updating](#updating) |
 | `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Source for `--check-update` and `--update`         |
 | `TELEGRAM_BOT_TOKEN`  | –               | Bot token from @BotFather                                        |
@@ -245,14 +251,18 @@ editor refuses anything else.
 | `EMAIL_FROM`          | `abuse-checker@<host>` | Sender address                                            |
 | `SMTP_URL`            | –               | `smtps://host:465` or `smtp://host:587` (STARTTLS enforced)      |
 | `SMTP_USER`/`SMTP_PASS` | –             | SMTP credentials. Without `SMTP_URL`, local `sendmail -t` is used |
-| `JIRA_URL`            | –               | Jira base URL, e.g. `https://your-org.atlassian.net`             |
-| `JIRA_EMAIL`          | –               | Jira Cloud account e-mail (Basic auth). Empty = Server/DC PAT (Bearer) |
+| `JIRA_BASE_URL`            | –               | Jira base URL, e.g. `https://company.atlassian.net`             |
+| `JIRA_USER_EMAIL`          | –               | Jira Cloud account e-mail (Basic auth). Empty = Server/DC PAT (Bearer) |
 | `JIRA_API_TOKEN`      | –               | Cloud API token or Server/DC personal access token               |
 | `JIRA_PROJECT_KEY`    | –               | Project for the issues, e.g. `SEC`                               |
 | `JIRA_ISSUE_TYPE`     | `Task`          | Issue type name, e.g. `Bug`, `Incident`                          |
 | `JIRA_UPDATE_MODE`    | `comment`       | `comment`: update the open issue for this host; `create`: always open a new one |
 | `JIRA_LABELS` / `JIRA_PRIORITY` | –     | Extra labels (comma-separated) and priority name                 |
 | `JIRA_ATTACH_REPORT`  | `true`          | Attach the HTML report to the issue                              |
+| `JIRA_WATCHDOG_PRIORITY` | –            | Priority for `[WATCHDOG ALERT]` issues, e.g. `Highest`           |
+
+The older names `JIRA_URL` and `JIRA_EMAIL` are still accepted as aliases of
+`JIRA_BASE_URL` and `JIRA_USER_EMAIL`.
 
 Free AbuseIPDB plans allow `check-block` only on networks up to `/24`. For
 larger blocks, split them or use `USE_CHECK_BLOCK=false` with a smaller range.
@@ -262,6 +272,46 @@ larger blocks, split them or use `USE_CHECK_BLOCK=false` with a smaller range.
 ## Managing IPs and recipients
 
 ### IPs and subnets
+
+Manage the pool from the CLI. Every change is validated and written
+atomically, and `ips.txt` keeps its `0644 root:abusechecker` permissions.
+
+```bash
+sudo abuse-checker --add-ip 203.0.113.10 2001:db8::1 198.51.100.0/28 --comment "web tier"
+sudo abuse-checker --list-ips            # alias: --ips
+sudo abuse-checker --del-ip 203.0.113.10 # alias: --rm-ip; also drops its state.json entry
+sudo abuse-checker --edit-ips            # $EDITOR on a temp copy, validated on save
+```
+
+```
+#    IP / SUBNET                  STATUS             COMMENT
+1    203.0.113.10                 DIRTY (87%)        web tier
+2    2001:db8::1                  CLEAN              web tier
+3    198.51.100.0/28              UNCHECKED          web tier
+4    not-an-ip                    INVALID
+
+4 entries in /etc/abuse-checker/ips.txt
+```
+
+How each command behaves:
+
+- **`--add-ip`** checks every argument as IPv4, IPv6 (including `::`
+  compression and `::ffff:a.b.c.d`) or CIDR (`/0-32`, `/0-128`). If any
+  argument is invalid, it adds **nothing** and exits non-zero, naming each bad
+  value. Entries that are already present (IPv6 compared case-insensitively)
+  are skipped with a message. `--comment` adds the same inline comment to
+  every new line.
+- **`--del-ip`** removes matching lines and deletes those targets from
+  `state.json` straight away, so no stale state is left behind. It exits
+  non-zero if nothing matched.
+- **`--list-ips`** shows each entry's status from the last run: `CLEAN`,
+  `DIRTY (score%)`, `UNCHECKED` for entries not checked yet, or `INVALID`.
+- **`--edit-ips`** opens a temporary copy. When you save, it lists invalid
+  entries and asks whether to edit again, save anyway or abort. Invalid
+  entries that were already in the file are only noted. Without a terminal,
+  it never saves new invalid entries.
+
+You can still edit the file by hand:
 
 ```bash
 sudo editor /etc/abuse-checker/ips.txt
@@ -325,16 +375,16 @@ When an alert fires (at least one `NEW` or `ESCALATED` IP, or
    `JIRA_ATTACH_REPORT="false"` to skip this).
 
 Once the issue is resolved and its status is in the Done category, the next
-alert opens a fresh issue. On Jira Cloud, set `JIRA_EMAIL` and an
+alert opens a fresh issue. On Jira Cloud, set `JIRA_USER_EMAIL` and an
 [API token](https://id.atlassian.com/manage-profile/security/api-tokens); the
 connector sends it as HTTP Basic auth. On Server/Data Center, leave
-`JIRA_EMAIL` empty and put a personal access token in `JIRA_API_TOKEN`; it is
+`JIRA_USER_EMAIL` empty and put a personal access token in `JIRA_API_TOKEN`; it is
 sent as a Bearer token. Either way, the token and the derived `Authorization`
 header only reach curl through `--config -` on stdin, and the token is
 redacted from logs.
 
 ```bash
-sudo abuse-checker --edit-secrets   # JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
+sudo abuse-checker --edit-secrets   # JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, ...
 sudo abuse-checker --test-notify    # creates a "[TEST] ..." issue
 ```
 
@@ -393,7 +443,7 @@ own subshell**, so one failing connector cannot stop the others or the run.
 | `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
 | `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
 | `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
-| `40-jira.sh` | `JIRA_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (required), plus `JIRA_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
+| `40-jira.sh` | `JIRA_BASE_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (required), plus `JIRA_USER_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
 | `99-custom.sh.example` | Documented template. Not loaded, because it does not end in `.sh`. |
 
 A connector defines two functions:
@@ -429,6 +479,8 @@ yours untouched.
 abuse-checker [--run | --dry-run | --test-notify | --force-full-report | --status | --reset-state]
 abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninstall [--keep|--purge]]
 abuse-checker [--check-update | --update [--force]]
+abuse-checker [--list-ips | --add-ip IP... [--comment T] | --del-ip IP... | --edit-ips]
+abuse-checker [--schedule SPEC|show|reset | --watchdog-recover]
 ```
 
 | Flag                  | Effect |
@@ -442,6 +494,12 @@ abuse-checker [--check-update | --update [--force]]
 | `--edit-secrets`      | Root only. Decrypt into RAM, edit, validate, re-encrypt, shred. See [Encrypted secrets](#encrypted-secrets). |
 | `--encrypt-secrets`   | Root only. Move a plain-text `secrets.conf` into the encrypted store and shred the original. |
 | `--set-secret KEY`    | Root only. Set one variable, reading the value from stdin (it never appears in `ps`). |
+| `--list-ips`, `--ips` | Numbered list of `ips.txt` with comments and status (`CLEAN`, `DIRTY (score%)`, `UNCHECKED`, `INVALID`). |
+| `--add-ip IP\|CIDR ... [--comment TEXT]` | Root only. Validate and append entries; duplicates are skipped and nothing is added if any value is invalid. |
+| `--del-ip`, `--rm-ip IP\|CIDR ...` | Root only. Remove entries from `ips.txt` and from `state.json`. |
+| `--edit-ips`          | Root only. Edit `ips.txt` in `$EDITOR`, validated on save. |
+| `--schedule SPEC`     | Root only. Set the run times (`"06:00,18:00"`, `every 6h`, `hourly`, an OnCalendar expression), or use `show` / `reset`. See [Scheduling](#scheduling). |
+| `--watchdog-recover`  | Root only. Repair a failed service, a stale lock or an inactive timer, and alert. See [Watchdog](#watchdog-and-auto-recovery). |
 | `--check-update`      | Compare the installed version with the latest on GitHub. |
 | `--update`, `--self-update` | Root only. Download, verify (`bash -n`) and install the latest version (`--force` reinstalls). See [Updating](#updating). |
 | `--uninstall`         | Root only. Interactive menu, or `--keep` / `--purge` for scripts. See [Uninstalling](#uninstalling). |
@@ -464,12 +522,85 @@ sudo ls -lt /var/lib/abuse-checker/reports/    # recent reports
 sudo abuse-checker --force-full-report         # re-send a complete picture
 ```
 
-To change the schedule, run `sudo systemctl edit abuse-checker.timer` and add:
+To change when checks run, see [Scheduling](#scheduling).
 
-```ini
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 07:30:00
+---
+
+## Scheduling
+
+By default the check runs once a day at 06:00, with up to 15 minutes of random
+delay. To change that without editing unit files:
+
+```bash
+sudo abuse-checker --schedule "06:00,14:00,22:00"   # several fixed times
+sudo abuse-checker --schedule "every 6h"            # also: 6h, 12h, hourly, daily, 2x/day
+sudo abuse-checker --schedule "Mon..Fri *-*-* 09:15:00"   # any systemd OnCalendar expression
+sudo abuse-checker --schedule show                  # current schedule + next runs
+sudo abuse-checker --schedule reset                 # back to daily 06:00
+```
+
+| Spec | OnCalendar written |
+|------|--------------------|
+| `06:00,18:00` | `*-*-* 06:00:00`, `*-*-* 18:00:00` |
+| `hourly` / `1h` | `hourly` |
+| `6h`, `every 6h` (also `2h 3h 4h 8h 12h`) | `*-*-* 00/6:00:00` |
+| `daily` | `*-*-* 06:00:00` |
+| `2x/day` / `4x/day` | 06:00 + 18:00 / every 6 h |
+| anything else | used as-is |
+
+Every expression is checked with `systemd-analyze calendar` before anything is
+written, and invalid input changes nothing. The schedule goes into
+`/etc/systemd/system/abuse-checker.timer.d/override.conf`, which starts with an
+empty `OnCalendar=` to clear the default. The command then runs
+`systemctl daemon-reload && systemctl restart abuse-checker.timer` and prints
+the next trigger times. The setup wizard asks the same question: once a day
+(default), 2x a day, 4x a day, or custom times. Updates never overwrite your
+override.
+
+---
+
+## Watchdog and auto-recovery
+
+`abuse-checker.service` recovers on its own:
+
+| Setting | Effect |
+|---------|--------|
+| `TimeoutStartSec=15min`, `RuntimeMaxSec=15min` | A run that hangs for 15 minutes is killed. A `Type=oneshot` run counts as starting until it exits, so `TimeoutStartSec` is the limit that actually applies. |
+| `Restart=on-failure`, `RestartSec=60s` | A crashed or killed run is retried after 60 s. |
+| `StartLimitIntervalSec=15min`, `StartLimitBurst=3` | At most 3 starts per 15 minutes. After that the unit is marked failed... |
+| `OnFailure=abuse-checker-watchdog.service` | ...and the watchdog starts. |
+
+`abuse-checker-watchdog.service` runs `abuse-checker --watchdog-recover` as
+root. It is started by `OnFailure=`, and also every 6 hours by
+`abuse-checker-watchdog.timer`. It:
+
+1. resets the failed state of `abuse-checker.service`;
+2. removes `/var/lib/abuse-checker/.lock` if no process holds it (a held lock
+   means a run is in progress, so it is left alone);
+3. makes sure `abuse-checker.timer` is enabled and active, and restarts it if
+   not;
+4. checks that the last successful run is less than `WATCHDOG_MAX_AGE_HOURS`
+   (default 48) old;
+5. if anything was wrong, sends a high-priority
+   **`[WATCHDOG ALERT] abuse-checker on <host> crashed and was recovered`** to
+   every configured connector. The alert lists the problems, the recovery
+   actions taken, and the last 15 lines of
+   `journalctl -u abuse-checker.service` with secrets redacted.
+
+How each connector delivers the watchdog alert:
+
+- **Telegram:** a 🚨 message with the log in a `<pre>` block.
+- **Slack:** a `:rotating_light:` header with the log in a code block.
+- **Email:** sent with `X-Priority: 1` and `Importance: high`.
+- **Jira:** always a **new** issue, labelled `abuse-checker-watchdog`, with
+  priority `JIRA_WATCHDOG_PRIORITY` if you set one.
+
+A healthy system produces no alert.
+
+```bash
+sudo abuse-checker --watchdog-recover           # run the check by hand
+systemctl list-timers abuse-checker-watchdog.timer
+journalctl -u abuse-checker-watchdog -n 30
 ```
 
 ---
@@ -640,6 +771,27 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
   error is surfaced while other connectors still deliver; Jira is skipped when
   not configured; `--test-notify` reaches it; the token and the Basic header
   never appear in argv and the token is redacted from logs;
+- Jira with `JIRA_BASE_URL`/`JIRA_USER_EMAIL`: `POST /rest/api/2/issue` with
+  project, issue type and summary table; the HTML report uploaded to
+  `/attachments` with `X-Atlassian-Token: no-check`; Basic auth; the token
+  never in argv and redacted from output;
+- IP pool: `--add-ip` with IPv4, IPv6 (compressed, embedded IPv4) and CIDR,
+  inline comments, `0644` kept, duplicate detection (IPv6 case-insensitive),
+  all-or-nothing rejection of `999.1.1.1`, `/33`, `:::`, `hello` and `/129`;
+  `--list-ips` statuses, comments and numbering; `--del-ip` and `--rm-ip`
+  removing entries from `ips.txt` and `state.json` and reporting `not found`;
+  `--edit-ips` saving valid edits, refusing new invalid entries without a
+  TTY, and cleaning up its temp file;
+- `--schedule`: the drop-in contents for `"06:00,18:00"`, `"7:05, 22:30"`,
+  `every 6h`, `6h`, `every 12h`, `hourly`, `daily` and `2x/day`; rejection of
+  `7h`, `25:00` and invalid raw expressions (via `systemd-analyze`); raw
+  OnCalendar; `daemon-reload` and timer restart; `show` and `reset`;
+- watchdog: a healthy system sends no alert; a failed service, a stale lock
+  and an inactive or disabled timer are repaired and alerted on Telegram,
+  Slack, email (high priority) and Jira (new issue, watchdog label and
+  priority); the 15 journal lines are included with secrets redacted; a held
+  lock is left alone; a stale `lastRun` raises an alert; the unit settings
+  are checked and the units pass `systemd-analyze verify`;
 - self-update: `--check-update` (newer, same, unreachable); `--update` with
   a good release, a corrupted `abuse-checker.sh`, a corrupted connector, a
   garbage archive and a failed download (each rejected, with the installed
@@ -665,7 +817,11 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `RAM directory /dev/shm not available` | Mount tmpfs on `/dev/shm`, or set `ABUSE_CHECKER_RAMDIR` to another tmpfs directory. |
 | `connector X: ... skipped` | That file in `connectors.d` is empty, has a syntax error, or lacks `connector_enabled`/`connector_send`. Fix or delete it. |
 | `Jira issue creation failed (HTTP 400): ...` | Jira's own error is shown, often a wrong `JIRA_ISSUE_TYPE` or a required field such as a component. Fix it with `--edit-secrets`, then retry with `--test-notify`. |
-| `Jira ... (HTTP 401/403)` | Wrong `JIRA_EMAIL` or token, or the account cannot create issues in the project. On Server/DC, leave `JIRA_EMAIL` empty to use a PAT. |
+| `Jira ... (HTTP 401/403)` | Wrong `JIRA_USER_EMAIL` or token, or the account cannot create issues in the project. On Server/DC, leave `JIRA_USER_EMAIL` empty to use a PAT. |
+| `error: invalid IP/CIDR: ...` from `--add-ip` | Nothing was added. Fix or remove the listed value, for example `/33` or `999.x`, and run the command again. |
+| `invalid OnCalendar expression` | Test the expression with `systemd-analyze calendar '<expr>'`, or use one of the presets. |
+| `[WATCHDOG ALERT]` received | The service failed 3 times within 15 minutes, or hung. Read the log lines in the alert and `journalctl -u abuse-checker -n 100`. Recovery has already run, and the next timer run retries. |
+| `start request repeated too quickly` | The start limit (3 per 15 minutes) was hit. The watchdog resets it, or run `sudo systemctl reset-failed abuse-checker`. |
 | `no connector delivered the alert` | No connector is configured. Run `--status` and check the `Connectors` line, then `--edit-secrets`. |
 | `IP list not readable` | Check that `ips.txt` exists and is `0644 root:abusechecker`. Re-running `install.sh` fixes the permissions. |
 | `state directory ... does not exist` | Run `sudo ./install.sh`. |

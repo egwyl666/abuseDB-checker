@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic abuse-checker watchdog check
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+RandomizedDelaySec=5min
+Unit=abuse-checker-watchdog.service
+
+[Install]
+WantedBy=timers.target

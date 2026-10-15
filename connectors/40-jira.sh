@@ -5,9 +5,10 @@
 # connector_send <classified.json> <report.html> <title>.
 #
 # Settings (from the encrypted secrets store):
-#   JIRA_URL            https://your-org.atlassian.net (or Server/DC base URL)
+#   JIRA_BASE_URL       https://company.atlassian.net (or Server/DC base URL)
+#                       (JIRA_URL is accepted as an alias)
 #   JIRA_API_TOKEN      Cloud API token, or a Server/DC personal access token
-#   JIRA_EMAIL          Cloud account e-mail (Basic auth). Leave empty to use
+#   JIRA_USER_EMAIL     Cloud account e-mail (Basic auth; alias JIRA_EMAIL). Empty: use
 #                       JIRA_API_TOKEN as a Bearer PAT (Server/Data Center).
 #   JIRA_PROJECT_KEY    e.g. SEC
 #   JIRA_ISSUE_TYPE     default "Task"
@@ -23,6 +24,11 @@
 
 # shellcheck disable=SC2034  # read by abuse-checker
 CONNECTOR_NAME="Jira"
+
+# Preferred names JIRA_BASE_URL / JIRA_USER_EMAIL; older JIRA_URL / JIRA_EMAIL
+# keep working.
+JIRA_URL="${JIRA_BASE_URL:-${JIRA_URL:-}}"
+JIRA_EMAIL="${JIRA_USER_EMAIL:-${JIRA_EMAIL:-}}"
 
 connector_enabled() {
     [[ -n "${JIRA_URL:-}" && -n "${JIRA_API_TOKEN:-}" && -n "${JIRA_PROJECT_KEY:-}" ]]
@@ -94,9 +100,16 @@ _jira_text() {
 
 connector_send() {
     local data="$1" report="$2" title="$3" text key payload="$TMPD/jira.json" labels
-    text="$(_jira_text "$data" "$report" "$title")"
+    local prio="${JIRA_PRIORITY:-}" extra_label=""
+    if [[ -n "${ALERT_BODY:-}" ]]; then
+        # Watchdog / free-text alert: always a new issue, own label + priority.
+        text="$(printf 'h3. %s\n{noformat}\n%s\n{noformat}\n' "$title" "${ALERT_BODY:0:30000}")"
+        prio="${JIRA_WATCHDOG_PRIORITY:-$prio}"; extra_label="abuse-checker-watchdog"
+    else
+        text="$(_jira_text "$data" "$report" "$title")"
+    fi
     key=""
-    if [[ "${JIRA_UPDATE_MODE:-comment}" != "create" ]]; then
+    if [[ "${JIRA_UPDATE_MODE:-comment}" != "create" && -z "${ALERT_BODY:-}" ]]; then
         _jira_find_open; key="$JIRA_OPEN_KEY"
     fi
 
@@ -106,9 +119,9 @@ connector_send() {
         [[ "$JIRA_CODE" == "201" || "$JIRA_CODE" == "200" ]] || { warn "Jira comment on $key failed (HTTP $JIRA_CODE)"; return 1; }
         info "Jira: updated $key with a new comment"
     else
-        labels="$( { printf 'abuse-checker\n%s\n' "$(_jira_host_label)"; split_csv "${JIRA_LABELS:-}"; } | jq -R . | jq -sc 'unique')"
+        labels="$( { printf 'abuse-checker\n%s\n' "$(_jira_host_label)"; [[ -z "$extra_label" ]] || echo "$extra_label"; split_csv "${JIRA_LABELS:-}"; } | jq -R . | jq -sc 'unique')"
         jq -n --arg p "$JIRA_PROJECT_KEY" --arg t "${JIRA_ISSUE_TYPE:-Task}" --arg s "${title:0:250}" \
-              --arg d "$text" --argjson labels "$labels" --arg prio "${JIRA_PRIORITY:-}" \
+              --arg d "$text" --argjson labels "$labels" --arg prio "$prio" \
             '{fields:({project:{key:$p}, issuetype:{name:$t}, summary:$s, description:$d, labels:$labels}
                       + (if $prio != "" then {priority:{name:$prio}} else {} end))}' > "$payload"
         _jira_call POST "/rest/api/2/issue" "$payload"
