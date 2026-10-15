@@ -83,14 +83,15 @@ _jira_host_label() { printf 'abuse-checker-%s' "$(printf '%s' "$HOST_LABEL" | tr
 
 # Jira wiki-markup text (REST v2 accepts it for description and comments).
 _jira_text() {
-    jq -r --arg title "$3" --arg report "$(basename "$2")" --arg upd "${UPDATE_NOTICE:-}" --argjson force "$FORCE_FULL" '
+    jq -r --arg title "$3" --arg report "$(basename "$2")" --arg upd "${UPDATE_NOTICE:-}" --argjson force "$FORCE_FULL" "$JQ_LIB"'
         def esc: tostring | gsub("\\|"; "/") | gsub("[\\[\\]{}]"; "");
         [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
         | "h3. \($title | esc)",
           "Checked: *\(length)* | New: *\(map(select(.status=="NEW"))|length)* | Escalated: *\(map(select(.status=="ESCALATED"))|length)* | Unchanged dirty: \(map(select(.status=="UNCHANGED"))|length)",
           "",
-          "||Status||IP / Subnet||Score||Reports||ISP||Country||Last reported||AbuseIPDB||",
+          "||Status||IP / Subnet||Score||Reports||Categories||Why (latest report)||ISP||Country||Last reported||AbuseIPDB||",
           ($a[:50][] | "|\(.status)|{{\(.target)}}|\(.score)%|\(.total)" + (if .delta > 0 then " (+\(.delta))" else "" end)
+             + "|\(catlist | if . == "" then "-" else esc end) |\(why | if . == "" then "-" else esc end) "
              + "|\((.isp // "-") | esc) |\(.country // "-") |\((.last // "-") | esc)|[check|https://www.abuseipdb.com/check/\(.target | @uri)]|"),
           (if ($a|length) > 50 then "_…and \(($a|length) - 50) more, see the attached report._" else empty end),
           "",

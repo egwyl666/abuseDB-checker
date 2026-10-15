@@ -20,7 +20,8 @@ connector_send() {
                 {type:"section", text:{type:"mrkdwn", text:("```" + $b + "```")}}]}' > "$payload" \
             || { warn "Slack: failed to build payload"; return 1; }
     else
-        jq --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --arg report "$(basename "$report")" --argjson force "$FORCE_FULL" '
+        jq --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --arg report "$(basename "$report")" --argjson force "$FORCE_FULL" "$JQ_LIB"'
+            def se: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
             [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
             | {text:$title, blocks:(
                 [{type:"header", text:{type:"plain_text", text:$title[:150]}},
@@ -31,7 +32,9 @@ connector_send() {
                     {type:"mrkdwn", text:":large_orange_circle: *Escalated:* \(map(select(.status=="ESCALATED"))|length)"}]},
                  {type:"divider"}]
                 + [$a[:20][] | {type:"section",
-                    text:{type:"mrkdwn", text:("*\(.status)* `\(.target)` — score *\(.score)%*, \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n_\(.isp)_ \(.country // "")" else "" end))},
+                    text:{type:"mrkdwn", text:("*\(.status)* `\(.target)` — score *\(.score)%*, \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n_\(.isp | se)_ \(.country // "")" else "" end)
+                        + (if catlist != "" then "\n:label: \(catlist | se)" else "" end)
+                        + (if why != "" then "\n> \(why | se)" else "" end))},
                     accessory:{type:"button", text:{type:"plain_text", text:"AbuseIPDB"}, url:"https://www.abuseipdb.com/check/\(.target|@uri)"}}]
                 + [{type:"context", elements:[{type:"mrkdwn", text:("\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted · full report: \($report)" + (if $upd != "" then "\n:arrow_up: \($upd)" else "" end))}]}])}' "$data" > "$payload" \
             || { warn "Slack: failed to build payload"; return 1; }

@@ -1,7 +1,7 @@
 # abuse-checker
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 **English** · [Українська](README.uk.md)
@@ -31,6 +31,7 @@ at once. They can also open or update a Jira issue.
 - [Daily maintenance](#daily-maintenance)
 - [Scheduling](#scheduling)
 - [Watchdog and auto-recovery](#watchdog-and-auto-recovery)
+- [System check (`--doctor`)](#system-check---doctor)
 - [Updating](#updating)
 - [Uninstalling](#uninstalling)
 - [Security model](#security-model)
@@ -87,9 +88,48 @@ from outside (about 6–15 KB for typical pools). It contains:
 - summary cards: Total checked, Clean, New, Escalated, Unchanged dirty, Errors;
 - a table you can filter and sort by clicking column headers. Columns: status
   badge, IP/subnet, colour-coded score, total reports with a `+delta` badge,
-  ISP/domain, country, last reported time, and a button to
-  `https://www.abuseipdb.com/check/<IP>`;
+  **top categories**, **distinct reporters**, ISP/domain, country, last
+  reported time, and a button to `https://www.abuseipdb.com/check/<IP>`;
+- a **drill-down** under every dirty row (`<details>`, "View N report
+  detail(s)"), plus an **Expand all / Collapse all** button next to the
+  search box. The search also matches text inside the details, such as log
+  comments:
+  - **single IP:** usage type, hostnames and distinct reporters, then the 10
+    most recent reports with timestamp (UTC), category badges, reporter
+    country and the full comment or log snippet in a monospace block;
+  - **CIDR:** every reported host inside the block (up to 25, worst score
+    first) with score, reports, last reported time, country and its own
+    AbuseIPDB link;
 - automatic dark mode.
+
+### Abuse details: categories and comments
+
+`/api/v2/check` is called with `verbose`, so AbuseIPDB returns the individual
+reports. abuse-checker keeps the details that explain the score:
+
+| Field | From |
+|-------|------|
+| Usage type, hostnames, distinct reporters | `usageType`, `hostnames[]`, `numDistinctUsers` |
+| Last 10 reports | `reports[]`: `reportedAt`, `comment`, categories, `reporterCountryCode` |
+| Top categories | All category IDs of the reports, translated to names (`18` → Brute-Force, `22` → SSH, `14` → Port Scan, ... all 23 [AbuseIPDB categories](https://www.abuseipdb.com/categories)), most frequent first |
+| Subnet hosts | `check-block` `reportedAddress[]`, top 25 by score |
+
+Every connector tells recipients *why* an IP was flagged before they open the
+report. For each `NEW` or `ESCALATED` IP it adds the categories, for example
+`[Brute-Force, SSH]`, and the latest report comment, cut to 120 characters
+with line breaks removed. For a subnet it shows its worst hosts instead.
+
+| Connector | Shown as |
+|-----------|----------|
+| Telegram | `🏷 [Brute-Force, SSH]` and `💬 <comment>` (HTML-escaped) |
+| Slack | `:label: [...]` and a `> quote` (escaped) |
+| Email | `Categories: ...` and `Why: ...` lines |
+| Jira | **Categories** and **Why (latest report)** columns in the table |
+
+Comments are written by third parties and can contain anything. They are
+HTML-escaped in the report and in Telegram, escaped for Slack, and have their
+markup characters stripped for Jira, so a comment such as
+`<script>...</script>` shows up as text.
 
 ---
 
@@ -137,7 +177,7 @@ tests/run_tests.sh          offline test suite (uses tests/mock_curl.sh)
 ### One-line install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 This downloads `install.sh`. Because there are no repository files next to it,
@@ -145,16 +185,27 @@ it fetches the tarball of the `main` branch
 (`https://github.com/egwyl666/abuseDB-checker/archive/refs/heads/main.tar.gz`)
 into a private `mktemp -d` directory and extracts it. It then runs `bash -n` on
 every script and only installs if all of them pass. The temporary directory is
-removed afterwards. The setup wizard still works, because it reads your
-answers from `/dev/tty` rather than from the pipe.
+removed afterwards. The command keeps stdin on your terminal, so the setup
+wizard and the OS-upgrade question work normally.
+
+> **Why not `curl ... | sudo bash`?** That form also works, but on Ubuntu
+> 22.04+ sudo runs the command in its own pseudo-terminal (`use_pty`). With
+> stdin taken by the pipe, the installer can end up outside the terminal's
+> foreground process group, where reading the keyboard would stop the
+> process. The installer detects this: it skips the questions, uses the
+> defaults (no OS upgrade, no wizard) and prints the `sudo bash -c` command
+> above. When it can read from `/dev/tty`, each question times out after
+> 120 s instead of waiting forever.
 
 Variants:
 
 ```bash
-# no wizard (Ansible, cloud-init, CI)
+# no wizard (Ansible, cloud-init, CI); the pipe form is fine here
 curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash -s -- --non-interactive
+# with an OS upgrade first
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)" -- --upgrade-os
 # another branch
-curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo AC_BRANCH=dev bash
+sudo AC_BRANCH=dev bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
 If you prefer to read the script first:
@@ -162,8 +213,11 @@ If you prefer to read the script first:
 
 ### From a git clone
 
-Requirements: a systemd-based Linux, Bash 4.4+, `curl` 7.55+, `jq` 1.6+,
-`tar` and `openssl` (systemd 250+ is used automatically when available).
+Requirements: a systemd-based Linux with `bash` 4.4+ and `curl`. Everything
+else (`jq`, `gawk`, `sed`, `openssl`, `flock` from util-linux, coreutils,
+findutils, `tar`, `ca-certificates`) is **installed automatically** if
+missing, using `apt-get`, `dnf`, `yum`, `apk`, `pacman` or `zypper`.
+systemd 250+ is used automatically when available.
 
 ```bash
 # Debian/Ubuntu
@@ -182,7 +236,18 @@ Options:
 
 - `--no-enable`: install without starting the timer;
 - `--non-interactive` (`--no-wizard`, `-n`): never show the setup wizard (also skipped
-  automatically when there is no TTY, e.g. in Ansible or cloud-init).
+  automatically when there is no TTY, e.g. in Ansible or cloud-init);
+- `--upgrade-os`: run a full non-interactive system package upgrade first.
+  Interactive installs ask instead:
+  `Would you like to update system packages (OS upgrade) before installing? [y/N]`
+  (the answer is read from `/dev/tty`, and the default is No).
+
+Before installing anything, `install.sh` runs `abuse-checker --install-deps`.
+It refreshes the package metadata and installs the missing packages without
+prompting, for example `DEBIAN_FRONTEND=noninteractive apt-get install -y ...`.
+If a dependency still cannot be installed, the installer stops with the
+package manager's error. In one-line mode, `tar` and `gzip` are installed
+first if needed, because they are required to unpack the download.
 
 ### Setup wizard
 
@@ -242,6 +307,7 @@ editor refuses anything else.
 | `RETENTION_DAYS`      | `30`            | Delete reports older than this                                   |
 | `HOST_LABEL`          | hostname        | Name shown in alerts and reports                                 |
 | `WATCHDOG_MAX_AGE_HOURS` | `48`         | Watchdog alerts if the last successful run is older than this    |
+| `AUTO_INSTALL_DEPS`   | `true`          | Root runs (`--update` pre-step, manual `sudo` runs) install missing dependencies instead of failing |
 | `AUTO_UPDATE`         | `notify`        | `notify`, `true` (auto-install) or `false`; see [Updating](#updating) |
 | `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Source for `--check-update` and `--update`         |
 | `TELEGRAM_BOT_TOKEN`  | –               | Bot token from @BotFather                                        |
@@ -473,6 +539,53 @@ yours untouched.
 
 ---
 
+## System check (`--doctor`)
+
+```bash
+sudo abuse-checker --doctor                 # alias: --check-system
+sudo abuse-checker --doctor --upgrade-os    # full OS package upgrade first
+```
+
+```
+[OK]    OS: Ubuntu 24.04.5 LTS (kernel 6.8.0-45-generic)
+[OK]    package manager: apt-get
+[FIXED] installed missing dependency: jq
+[OK]    bash 5.2.21(1)-release (>= 4.4)
+[OK]    curl 8.5.0
+[OK]    /etc/abuse-checker/secrets.conf.enc (640 root:abusechecker)
+[FIXED] /etc/abuse-checker/ips.txt: 777 root:root -> 644 root:abusechecker
+[OK]    abuse-checker.timer enabled and active
+[OK]    free disk space in /var/lib/abuse-checker: 30665 MB
+[OK]    HTTPS to api.abuseipdb.com reachable (HTTP 401)
+
+Summary: 15 OK, 2 fixed, 0 warning(s)
+```
+
+It checks the following:
+
+- **System:** OS and kernel, the package manager, and versions of `bash`
+  (at least 4.4), `curl`, `jq` and `openssl`.
+- **Dependencies:** every required tool and the CA bundle. As root, missing
+  ones are installed and reported as `[FIXED]`.
+- **Files:** the service user, plus the owner and mode of every file and
+  directory in [File locations](#file-locations-fhs). As root, wrong values
+  are fixed. A plain-text `secrets.conf` gets a warning.
+- **systemd:** `abuse-checker.timer` and the watchdog timer must be enabled
+  and active, and `abuse-checker.service` must not be failed. As root, these
+  are fixed.
+- **Resources:** free disk space in `/var/lib/abuse-checker`, which must be
+  at least 100 MB.
+- **Network:** outbound HTTPS to `https://api.abuseipdb.com`. No API key is
+  needed, because any HTTP answer proves the host is reachable.
+
+The exit code is `0` when no warnings remain, so `--doctor` can be used in
+monitoring. Scheduled runs repair missing dependencies too. The service's
+root pre-step (`ExecStartPre=+... --auto-update`) installs anything missing,
+and any manual `sudo abuse-checker` run does the same unless you set
+`AUTO_INSTALL_DEPS=false`.
+
+---
+
 ## CLI reference
 
 ```
@@ -481,6 +594,7 @@ abuse-checker [--edit-secrets | --encrypt-secrets | --set-secret KEY | --uninsta
 abuse-checker [--check-update | --update [--force]]
 abuse-checker [--list-ips | --add-ip IP... [--comment T] | --del-ip IP... | --edit-ips]
 abuse-checker [--schedule SPEC|show|reset | --watchdog-recover]
+abuse-checker [--doctor | --check-system | --install-deps] [--upgrade-os]
 ```
 
 | Flag                  | Effect |
@@ -500,6 +614,8 @@ abuse-checker [--schedule SPEC|show|reset | --watchdog-recover]
 | `--edit-ips`          | Root only. Edit `ips.txt` in `$EDITOR`, validated on save. |
 | `--schedule SPEC`     | Root only. Set the run times (`"06:00,18:00"`, `every 6h`, `hourly`, an OnCalendar expression), or use `show` / `reset`. See [Scheduling](#scheduling). |
 | `--watchdog-recover`  | Root only. Repair a failed service, a stale lock or an inactive timer, and alert. See [Watchdog](#watchdog-and-auto-recovery). |
+| `--doctor`, `--check-system` `[--upgrade-os]` | System checklist with `[OK]`, `[WARN]` and `[FIXED]` lines; as root it installs missing dependencies and fixes permissions. See [System check](#system-check---doctor). |
+| `--install-deps` `[--upgrade-os]` | Root only. Install missing dependencies (used by `install.sh`). |
 | `--check-update`      | Compare the installed version with the latest on GitHub. |
 | `--update`, `--self-update` | Root only. Download, verify (`bash -n`) and install the latest version (`--force` reinstalls). See [Updating](#updating). |
 | `--uninstall`         | Root only. Interactive menu, or `--keep` / `--purge` for scripts. See [Uninstalling](#uninstalling). |
@@ -786,6 +902,20 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
   `every 6h`, `6h`, `every 12h`, `hourly`, `daily` and `2x/day`; rejection of
   `7h`, `25:00` and invalid raw expressions (via `systemd-analyze`); raw
   OnCalendar; `daemon-reload` and timer restart; `show` and `reset`;
+- abuse details: category map (`18` → Brute-Force, `22` → SSH, all of
+  1..23); `norm_check` ordering by frequency and newest report, plus
+  metadata; `norm_block` host sorting; the report's new columns, badges,
+  `<details>` for IPs and subnets, sub-tables, newest-first order, escaping
+  of `<script>` / `&` / quotes in comments, the Expand all button, balanced
+  tags and size; categories and the 120-character snippet in Telegram,
+  Slack, email and Jira; `--dry-run` mocks carrying verbose reports;
+- `--doctor` / `--check-system` with a fake package manager: OS line,
+  install of the mapped packages with `[FIXED]`, version checks, a mode fix
+  (`777` → `644`), plain-text secrets warning, systemd checks, disk space,
+  HTTPS reachability, summary and exit code, `--upgrade-os`, a failed
+  install giving `[WARN]`; `--install-deps` package mapping for `dnf`, `yum`,
+  `apk`, `pacman` and `zypper`; the runtime root fallback and
+  `AUTO_INSTALL_DEPS=false`;
 - watchdog: a healthy system sends no alert; a failed service, a stale lock
   and an inactive or disabled timer are repaired and alerted on Telegram,
   Slack, email (high priority) and Jira (new issue, watchdog label and
@@ -822,6 +952,10 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `invalid OnCalendar expression` | Test the expression with `systemd-analyze calendar '<expr>'`, or use one of the presets. |
 | `[WATCHDOG ALERT]` received | The service failed 3 times within 15 minutes, or hung. Read the log lines in the alert and `journalctl -u abuse-checker -n 100`. Recovery has already run, and the next timer run retries. |
 | `start request repeated too quickly` | The start limit (3 per 15 minutes) was hit. The watchdog resets it, or run `sudo systemctl reset-failed abuse-checker`. |
+| One-line installer stops at a question and does not react to input | You used `curl ... \| sudo bash` with an older installer (1.4.0 or earlier). Installation was already finished, so press Ctrl+C. Use `sudo bash -c "$(curl -fsSL ...install.sh)"` next time; from 1.5.0 the pipe form no longer blocks. |
+| `missing dependencies: ... (run: sudo abuse-checker --doctor)` | Run `sudo abuse-checker --doctor`; it installs what is missing. If that fails, check the package manager's error (offline mirror, held packages). |
+| `--doctor`: `cannot reach https://api.abuseipdb.com` | DNS, firewall or proxy is blocking outbound HTTPS. Test with `curl -sI https://api.abuseipdb.com`. |
+| Report row has no "View ... detail(s)" | That IP has no reports in the window, or it is clean. Subnets list hosts only when AbuseIPDB returned some. |
 | `no connector delivered the alert` | No connector is configured. Run `--status` and check the `Connectors` line, then `--edit-secrets`. |
 | `IP list not readable` | Check that `ips.txt` exists and is `0644 root:abusechecker`. Re-running `install.sh` fixes the permissions. |
 | `state directory ... does not exist` | Run `sudo ./install.sh`. |

@@ -84,7 +84,7 @@ report_file() { echo "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date '+%Y-%m-%d'
 
 # ---------------------------------------------------------------------------
 section "Static checks"
-for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh tests/mock_systemctl.sh tests/mock_journalctl.sh \
+for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh tests/mock_systemctl.sh tests/mock_journalctl.sh tests/mock_pkg.sh \
          connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh connectors/99-custom.sh.example; do
     if bash -n "$ROOT/$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; fi
     if command -v shellcheck >/dev/null 2>&1; then
@@ -736,6 +736,124 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     check "units pass systemd-analyze verify" bash -c 'SYSTEMD_LOG_LEVEL=err systemd-analyze verify --man=no "$@" 2>&1 | grep -v "not executable" | grep -q . && exit 1 || exit 0' _ \
         "$ROOT/systemd/abuse-checker.service" "$ROOT/systemd/abuse-checker.timer" "$ROOT/systemd/abuse-checker-watchdog.service" "$ROOT/systemd/abuse-checker-watchdog.timer"
 fi
+
+# ---------------------------------------------------------------------------
+section "Verbose abuse details: categories, comments, drill-down"
+setup_env
+check "category map: 18 -> Brute-Force, 22 -> SSH, 14 -> Port Scan" bash -c 'source "$1"; [[ "$(jq -rn "$JQ_LIB [18,22,14,4,9,23,99] | map(catname) | join(\"|\")")" == "Brute-Force|SSH|Port Scan|DDoS Attack|Open Proxy|IoT Targeted|Category 99" ]]' _ "$SCRIPT"
+check "category map covers 1..23" bash -c 'source "$1"; [[ "$(jq -rn "$JQ_LIB [range(1;24)] | map(catname) | map(select(startswith(\"Category \"))) | length")" == 0 ]]' _ "$SCRIPT"
+cat > "$MOCK_FIX/192.0.2.2.json" <<'JSON'
+{"data":{"ipAddress":"192.0.2.2","abuseConfidenceScore":92,"totalReports":3,"numDistinctUsers":3,
+ "lastReportedAt":"2026-10-14T21:17:39+00:00","isp":"Evil Hosting","domain":"evil.example","countryCode":"RU",
+ "usageType":"Data Center/Web Hosting/Transit","hostnames":["scan01.evil.example","scan02.evil.example"],
+ "reports":[
+  {"reportedAt":"2026-10-12T10:00:00+00:00","comment":"Port scan detected on 22,80,443","categories":[14],"reporterId":1,"reporterCountryCode":"US"},
+  {"reportedAt":"2026-10-14T21:17:39+00:00","comment":"SSH brute-force login attempt from user root <script>alert(1)</script> & \"quotes\"\nsecond line","categories":[18,22],"reporterId":2,"reporterCountryCode":"DE"},
+  {"reportedAt":"2026-10-13T09:00:00+00:00","comment":"Failed password for invalid user admin from 192.0.2.2 port 51234 ssh2","categories":[18,22],"reporterId":3,"reporterCountryCode":"FR"}]}}
+JSON
+printf '{"data":{"networkAddress":"198.51.100.0","numPossibleHosts":254,"reportedAddress":[
+ {"ipAddress":"198.51.100.9","numReports":2,"mostRecentReport":"2026-10-10T08:00:00+00:00","abuseConfidenceScore":20,"countryCode":"NL"},
+ {"ipAddress":"198.51.100.77","numReports":30,"mostRecentReport":"2026-10-14T08:00:00+00:00","abuseConfidenceScore":95,"countryCode":"NL"},
+ {"ipAddress":"198.51.100.5","numReports":7,"mostRecentReport":"2026-10-12T08:00:00+00:00","abuseConfidenceScore":51,"countryCode":"NL"}]}}' > "$MOCK_FIX/198.51.100.0_24.json"
+printf 'JIRA_BASE_URL="https://jira.test"\nJIRA_API_TOKEN="dummyJiraTokenDetails123456"\nJIRA_PROJECT_KEY="SEC"\n' >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+run_checker --run
+R="$(report_file)"
+check "details: run rc 0" test "$RC" -eq 0
+check "norm_check: topCategories by frequency, reports newest first, metadata" bash -c 'source "$1"; jq -ce --arg t x "$JQ_LIB $norm_check | .topCategories == [\"Brute-Force\",\"SSH\",\"Port Scan\"] and .reports[0].reportedAt == \"2026-10-14T21:17:39+00:00\" and .reports[0].categories == [\"Brute-Force\",\"SSH\"] and .distinctUsers == 3 and .usage != \"\" and (.hostnames | contains(\"scan02\"))" "$2" >/dev/null' _ "$SCRIPT" "$MOCK_FIX/192.0.2.2.json"
+check "norm_block: hosts sorted by score, fields kept" bash -c 'source "$1"; jq -ce --arg t x "$JQ_LIB $norm_block | (.hosts | map(.ipAddress)) == [\"198.51.100.77\",\"198.51.100.5\",\"198.51.100.9\"] and .hosts[0].numReports == 30 and .reportedHosts == 3" "$2" >/dev/null' _ "$SCRIPT" "$MOCK_FIX/198.51.100.0_24.json"
+check "report: Top categories + Distinct reporters columns" bash -c 'grep -q "<th>Top categories</th><th>Distinct reporters</th>" "$1"' _ "$R"
+check "report: category badges in main row (Brute-Force, SSH, Port Scan)" bash -c 'grep -q "<span class=\"cat\">Brute-Force</span> <span class=\"cat\">SSH</span> <span class=\"cat\">Port Scan</span>" "$1"' _ "$R"
+check "report: distinct reporters value" grep -q '<td data-v="3">3</td>' "$R"
+check "report: <details> drill-down for IP" grep -q '<details><summary>View 3 report detail(s)</summary>' "$R"
+check "report: metadata usage type + hostnames" bash -c 'grep -q "<b>Usage type:</b> Data Center/Web Hosting/Transit" "$1" && grep -q "scan01.evil.example, scan02.evil.example" "$1"' _ "$R"
+check "report: sub-table headers" grep -q '<th>Timestamp (UTC)</th><th>Categories</th><th>Reporter</th><th>Comment / log snippet</th>' "$R"
+check "report: newest report first" bash -c 'grep "View 3 report detail(s)" "$1" | sed "s/.*View 3 report detail(s)//" | grep -o "<td class=\"m nw\">2026-10-1[234] [0-9:]*</td>" | head -1 | grep -q "2026-10-14 21:17:39"' _ "$R"
+check "report: comment shown in <pre>" grep -q '<pre>Failed password for invalid user admin' "$R"
+check "report: <script> in comment escaped" grep -qF '&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quotes&quot;' "$R"
+check "report: no raw <script>alert" bash -c '! grep -q "<script>alert" "$1"' _ "$R"
+check "report: <details> drill-down for CIDR" grep -q '<details><summary>View 3 reported host(s)</summary>' "$R"
+check "report: CIDR sub-hosts sorted by score desc" bash -c 'grep -o "<td class=\"m\">198\.51\.100\.[0-9]*</td>" "$1" | sed "s/<[^>]*>//g" | paste -sd, - | grep -qx "198.51.100.77,198.51.100.5,198.51.100.9"' _ "$R"
+check "report: CIDR sub-host link" grep -q 'href="https://www.abuseipdb.com/check/198.51.100.77"' "$R"
+check "report: CIDR reported-host count column" grep -q '3 <small>hosts</small>' "$R"
+check "report: Expand all button" grep -q '<button id="xa" type="button">Expand all</button>' "$R"
+check "report: clean IP has no drill-down" bash -c '! grep -A1 "192.0.2.1</td>" "$1" | grep -q "<details>"' _ "$R"
+check "report: still < 30KB" test "$(wc -c < "$R")" -lt 30720
+check "report: balanced <details>" bash -c '[[ $(grep -o "<details>" "$1" | wc -l) == $(grep -o "</details>" "$1" | wc -l) ]]' _ "$R"
+check "telegram: categories line" grep -q '🏷 \[Brute-Force, SSH, Port Scan\]' "$MOCK_LOG/config.log"
+check "telegram: escaped latest comment (newline collapsed)" grep -qF '💬 <code>SSH brute-force login attempt from user root &lt;script&gt;alert(1)&lt;/script&gt; &amp; \"quotes\" second line</code>' "$MOCK_LOG/config.log"
+check "telegram: CIDR worst hosts" grep -qF '💬 <code>worst hosts: 198.51.100.77 (95%), 198.51.100.5 (51%), 198.51.100.9 (20%)</code>' "$MOCK_LOG/config.log"
+check "slack: categories + escaped quote" bash -c 'jq -e "[.blocks[].text.text? // empty] | map(select(contains(\":label: [Brute-Force, SSH, Port Scan]\") and contains(\"> SSH brute-force login attempt from user root &lt;script&gt;\"))) | length == 1" "$1"' _ "$MOCK_LOG/slack_payload.log"
+check "email: Categories + Why lines" bash -c 'grep -q "Categories: \[Brute-Force, SSH, Port Scan\]" "$1" && grep -q "Why: SSH brute-force login attempt from user root" "$1"' _ "$MOCK_LOG/mail.log"
+check "jira: Categories + Why columns" jq -se 'map(select(.fields))[0].fields.description | contains("||Categories||Why (latest report)||") and contains("Brute-Force, SSH, Port Scan |SSH brute-force login attempt from user root")' "$MOCK_LOG/jira_payloads.log"
+LONG="$(jq -r 'map(select(.fields))[0].fields.description' "$MOCK_LOG/jira_payloads.log" | grep -o 'SSH brute-force login attempt[^|]*' | head -1)"
+check "snippet truncated to 120 chars + ellipsis" bash -c '[[ ${#1} -le 122 ]]' _ "$LONG"
+run_checker --dry-run
+check "dry-run mock carries verbose reports" bash -c 'grep -qE "SSH brute-force login attempt|Port scan: 1,024|Spam relay" "$1"' _ "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date +%F)_dryrun.html"
+check "dry-run mock CIDR breakdown" grep -q 'View 3 reported host(s)' "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date +%F)_dryrun.html"
+
+# ---------------------------------------------------------------------------
+section "System doctor (--doctor / --check-system) and dependency auto-install"
+setup_env
+export ABUSE_CHECKER_PKG_MGR=apt-get ABUSE_CHECKER_PKG_CMD="$HERE/mock_pkg.sh"
+export ABUSE_CHECKER_FAKE_MISSING_FILE="$WORK/fake_missing" ABUSE_CHECKER_SYSTEMCTL="$HERE/mock_systemctl.sh"
+export ABUSE_CHECKER_DOCTOR_URL="https://api.abuseipdb.com/api/v2/check"
+printf 'PRETTY_NAME="Testix 1.0"\nID=testix\n' > "$WORK/os-release"; export ABUSE_CHECKER_OS_RELEASE="$WORK/os-release"
+: > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+echo '{"version":1,"ips":{}}' > "$ABUSE_CHECKER_STATE_DIR/state.json"
+mkdir -p "$ABUSE_CHECKER_STATE_DIR/reports"; chmod 750 "$ABUSE_CHECKER_STATE_DIR" "$ABUSE_CHECKER_STATE_DIR/reports"; chmod 640 "$ABUSE_CHECKER_STATE_DIR/state.json"
+chmod 755 "$ABUSE_CHECKER_CONF_DIR"; chmod 600 "$ABUSE_CHECKER_CONF_DIR/secrets.conf"; chmod 777 "$ABUSE_CHECKER_CONF_DIR/ips.txt"
+printf 'jq\nflock\nca-certificates\n' > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+: > "$MOCK_LOG/pkg.log"
+cmd --doctor
+check "doctor: OS line" grep -qF "[OK]    OS: Testix 1.0" <<< "$OUT"
+check "doctor: package manager" grep -qF "[OK]    package manager: apt-get" <<< "$OUT"
+check "doctor: refreshed metadata" grep -qx "update -qq" "$MOCK_LOG/pkg.log"
+check "doctor: installed mapped packages non-interactively" grep -qx "install -y -qq --no-install-recommends jq util-linux ca-certificates" "$MOCK_LOG/pkg.log"
+check "doctor: [FIXED] per installed dependency" bash -c 'grep -qF "[FIXED] installed missing dependency: jq" <<< "$1" && grep -qF "[FIXED] installed missing dependency: flock" <<< "$1"' _ "$OUT"
+check "doctor: bash version check" grep -qE '^\[OK\] +bash [0-9.]+.* \(>= 4\.4\)' <<< "$OUT"
+check "doctor: tool versions" bash -c 'grep -q "^\[OK\]    curl " <<< "$1" && grep -q "^\[OK\]    jq " <<< "$1" && grep -q "^\[OK\]    openssl " <<< "$1"' _ "$OUT"
+check "doctor: fixed ips.txt mode 777 -> 644" bash -c 'grep -q "^\[FIXED\] .*ips.txt: 777" <<< "$1" && [[ $(stat -c %a "$2") == 644 ]]' _ "$OUT" "$ABUSE_CHECKER_CONF_DIR/ips.txt"
+check "doctor: warns about plain-text secrets" grep -qF "secrets stored in plain text" <<< "$OUT"
+check "doctor: systemd timers checked" grep -qF "[OK]    abuse-checker.timer enabled and active" <<< "$OUT"
+check "doctor: failed service reset" bash -c '! grep -q "abuse-checker.service is in the failed" <<< "$1"' _ "$OUT"
+check "doctor: disk space" grep -qE '^\[OK\] +free disk space' <<< "$OUT"
+check "doctor: HTTPS connectivity" grep -qF "HTTPS to api.abuseipdb.com reachable (HTTP 200)" <<< "$OUT"
+check "doctor: summary line" grep -qE '^Summary: [0-9]+ OK, [0-9]+ fixed, [0-9]+ warning\(s\)$' <<< "$OUT"
+check "doctor: rc!=0 while warnings remain" test "$RC" -ne 0
+cmd --check-system --upgrade-os
+check "--check-system --upgrade-os runs non-interactive upgrade" grep -qx -- "-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade" "$MOCK_LOG/pkg.log"
+check "--check-system: upgrade reported" grep -qF "[FIXED] system packages upgraded" <<< "$OUT"
+printf 'jq\n' > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+MOCK_PKG_FAIL=1 cmd --doctor
+check "doctor: failed install -> [WARN] missing" grep -qF "[WARN]  missing dependency: jq" <<< "$OUT"
+for pm in dnf yum apk pacman zypper; do
+    : > "$MOCK_LOG/pkg.log"; printf 'flock\nawk\n' > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+    ABUSE_CHECKER_PKG_MGR=$pm cmd --install-deps
+    case $pm in
+        dnf|yum) want="-q -y install gawk util-linux" ;;
+        apk) want="-q add --no-cache gawk flock" ;;
+        pacman) want="-S --needed --noconfirm gawk util-linux" ;;
+        zypper) want="--non-interactive --quiet install --no-recommends gawk util-linux" ;;
+    esac
+    check "--install-deps with $pm: $want" bash -c '[[ $1 -eq 0 ]] && grep -qxF -- "$2" "$3"' _ "$RC" "$want" "$MOCK_LOG/pkg.log"
+done
+: > "$ABUSE_CHECKER_FAKE_MISSING_FILE"; : > "$MOCK_LOG/pkg.log"
+cmd --install-deps
+check "--install-deps: nothing missing -> no package calls" bash -c '[[ $1 -eq 0 ]] && [[ ! -s "$2" ]] && grep -q "all dependencies present" <<< "$3"' _ "$RC" "$MOCK_LOG/pkg.log" "$OUT"
+printf 'jq\n' > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "runtime root fallback installs missing jq and runs" bash -c '[[ $1 -eq 0 ]] && grep -q "installed missing dependencies: jq" <<< "$2"' _ "$RC" "$OUT"
+printf 'jq\n' > "$ABUSE_CHECKER_FAKE_MISSING_FILE"
+AUTO_INSTALL_DEPS=false run_checker --run
+check "AUTO_INSTALL_DEPS=false: clear error instead" bash -c '[[ $1 -ne 0 ]] && grep -q "missing dependencies: jq (run: sudo abuse-checker --doctor)" <<< "$2"' _ "$RC" "$OUT"
+unset ABUSE_CHECKER_PKG_MGR ABUSE_CHECKER_PKG_CMD ABUSE_CHECKER_FAKE_MISSING_FILE ABUSE_CHECKER_SYSTEMCTL ABUSE_CHECKER_DOCTOR_URL ABUSE_CHECKER_OS_RELEASE
+check "install.sh: --upgrade-os flag + exact prompt" bash -c 'grep -q -- "--upgrade-os) UPGRADE_OS=true" "$1" && grep -qF "Would you like to update system packages (OS upgrade) before installing? [y/N]" "$1"' _ "$ROOT/install.sh"
+check "install.sh: uses --install-deps before installing" grep -q 'deps_args=(--install-deps)' "$ROOT/install.sh"
+check "install.sh: /dev/tty only used in the terminal foreground" grep -q 'elif tty_in_foreground && { exec 3</dev/tty; }' "$ROOT/install.sh"
+check "install.sh: every prompt read has a timeout in pipe mode" bash -c '[[ $(grep -c "read -r[^|]*-u \"\$TTY_FD\"" "$1") -gt 0 && $(grep "read -r[^|]*-u \"\$TTY_FD\"" "$1" | grep -vc "READ_T\[@\]") -eq 0 ]]' _ "$ROOT/install.sh"
+check "install.sh: piped, no foreground tty -> defaults, no hang" bash -c 'out="$(cd "$1" && timeout 30 bash -c "ABUSE_CHECKER_TTY_FOREGROUND=0 ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash -n install.sh && echo ok")"; [[ "$out" == ok ]]' _ "$ROOT"
+check "README recommends sudo bash -c \"\$(curl ...)\"" grep -q '^sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"$' "$ROOT/README.md"
 
 # ---------------------------------------------------------------------------
 section "Self-update: --check-update / --update / AUTO_UPDATE"

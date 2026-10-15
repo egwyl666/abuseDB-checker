@@ -3,9 +3,10 @@
 # IP list and state are never overwritten.
 #
 # Local mode (from a clone):
-#   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard]
+#   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]
 # One-line mode (downloads the repository tarball itself):
-#   curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
+#   curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash   # also works
 #   ... | sudo AC_BRANCH=<branch> bash        # install another branch
 #
 # The whole script is one { ... } block so bash parses it completely before
@@ -25,7 +26,18 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)" || SRC="$(pwd
 # the tarball, verify it and run its install.sh with the same arguments.
 if [[ ! -f "$SRC/abuse-checker.sh" || ! -d "$SRC/connectors" ]]; then
     [[ -z "${AC_BOOTSTRAPPED:-}" ]] || { echo "error: downloaded archive is incomplete" >&2; exit 1; }
-    for t in curl tar; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
+    # tar/gzip are needed to unpack the archive; install them if absent.
+    if ! command -v tar >/dev/null 2>&1 || ! command -v gzip >/dev/null 2>&1; then
+        echo "==> installing tar/gzip"
+        if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tar gzip
+        elif command -v dnf >/dev/null; then dnf -q -y install tar gzip
+        elif command -v yum >/dev/null; then yum -q -y install tar gzip
+        elif command -v apk >/dev/null; then apk -q add --no-cache tar gzip
+        elif command -v pacman >/dev/null; then pacman -Sy --needed --noconfirm tar gzip
+        elif command -v zypper >/dev/null; then zypper --non-interactive --quiet install tar gzip
+        fi </dev/null || true
+    fi
+    for t in curl tar gzip; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
     BOOT="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-install.XXXXXX")"
     trap 'rm -rf "$BOOT"' EXIT
     echo "==> downloading $REPO_SLUG@$REPO_BRANCH"
@@ -53,12 +65,14 @@ DOC_DIR="/usr/local/share/doc/abuse-checker"
 LIB_DIR="/usr/local/lib/abuse-checker"
 ENABLE=true
 INTERACTIVE=true
+UPGRADE_OS=false
 
 for a in "$@"; do
     case "$a" in
         --no-enable) ENABLE=false ;;
         --non-interactive|--no-wizard|-n) INTERACTIVE=false ;;
-        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard]"; exit 0 ;;
+        --upgrade-os) UPGRADE_OS=true ;;
+        -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]"; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
     esac
 done
@@ -67,9 +81,49 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "run as root (sudo $0)"
-for t in bash curl jq awk sed date mktemp find install openssl; do
-    command -v "$t" >/dev/null 2>&1 || die "missing dependency '$t' (e.g. apt install curl jq)"
-done
+
+# Interactive input: stdin when it is a terminal, otherwise /dev/tty (under
+# `curl | sudo bash` stdin is the pipe). TTY_FD stays empty when there is
+# no terminal at all or --non-interactive was given.
+#
+# Pitfall: with `curl | sudo bash` sudo (use_pty) may run us outside the
+# terminal's foreground process group; reading /dev/tty then stops the
+# process (SIGTTIN) and the installer looks hung. So /dev/tty is only used
+# when we really are in the foreground, and every pipe-mode prompt has a
+# timeout. `sudo bash -c "$(curl -fsSL ...)"` keeps stdin on the terminal
+# and avoids all of this.
+TTY_FD=""
+READ_T=()
+tty_in_foreground() {
+    [[ "${ABUSE_CHECKER_TTY_FOREGROUND:-}" == "0" ]] && return 1
+    command -v ps >/dev/null 2>&1 || return 0
+    [[ "$(ps -o stat= -p $$ 2>/dev/null)" == *+* ]]
+}
+if $INTERACTIVE && [[ -t 1 ]]; then
+    if [[ -t 0 ]]; then
+        TTY_FD=0
+    elif tty_in_foreground && { exec 3</dev/tty; } 2>/dev/null; then
+        TTY_FD=3
+        READ_T=(-t "${ABUSE_CHECKER_PROMPT_TIMEOUT:-120}")
+    else
+        say "no usable terminal for questions (common with 'curl | sudo bash'); using defaults"
+        say "for the interactive setup run: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/$REPO_BRANCH/install.sh)\""
+    fi
+fi
+
+# System check: optional OS upgrade, then install any missing dependency
+# (bash curl jq awk sed openssl flock coreutils findutils tar ca-certificates)
+# with the detected package manager. The logic lives in abuse-checker.sh.
+if ! $UPGRADE_OS && [[ -n "$TTY_FD" ]]; then
+    read -r "${READ_T[@]}" -u "$TTY_FD" -p "Would you like to update system packages (OS upgrade) before installing? [y/N] " reply || reply=""
+    [[ "$reply" =~ ^[Yy] ]] && UPGRADE_OS=true
+fi
+say "checking system dependencies"
+deps_args=(--install-deps)
+$UPGRADE_OS && deps_args+=(--upgrade-os)
+bash "$SRC/abuse-checker.sh" "${deps_args[@]}" </dev/null | sed 's/^/    /' \
+    || die "required dependencies could not be installed (see above)"
+command -v install >/dev/null 2>&1 || die "'install' (coreutils) is required"
 for f in abuse-checker.sh systemd/abuse-checker.service systemd/abuse-checker.timer \
          systemd/abuse-checker-watchdog.service systemd/abuse-checker-watchdog.timer \
          config/secrets.conf.example config/ips.txt.example \
@@ -161,7 +215,7 @@ if $UPDATE; then say "update complete ($("$BIN" --version))"; else say "install 
 # ask VAR "prompt" [silent]: read one answer; Enter = skip.
 ask() {
     local __v
-    if [[ "${3:-}" == "silent" ]]; then read -r -s -u "$TTY_FD" -p "    $2: " __v || __v=""; echo; else read -r -u "$TTY_FD" -p "    $2: " __v || __v=""; fi
+    if [[ "${3:-}" == "silent" ]]; then read -r -s "${READ_T[@]}" -u "$TTY_FD" -p "    $2: " __v || __v=""; echo; else read -r "${READ_T[@]}" -u "$TTY_FD" -p "    $2: " __v || __v=""; fi
     printf -v "$1" '%s' "$__v"
 }
 # put KEY VALUE: store via stdin so the value never shows up in `ps`.
@@ -175,7 +229,7 @@ wizard() {
     local reply v1 v2 v3 v4
     echo
     echo "Would you like to configure API keys and notification connectors now? [y/N]"
-    read -r -u "$TTY_FD" -p "(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets') " reply || reply=""
+    read -r "${READ_T[@]}" -u "$TTY_FD" -p "(Tip: Press Enter or 'N' to skip and configure manually later via 'sudo abuse-checker --edit-secrets') " reply || reply=""
     [[ "$reply" =~ ^[Yy] ]] || { echo "Skipped. Configure later with: sudo abuse-checker --edit-secrets"; return 0; }
     echo "Every step is optional: press Enter to skip it."
     echo
@@ -208,35 +262,29 @@ wizard() {
     echo "  Check schedule"
     echo "    1) once a day at 06:00 (default)   2) twice a day (06:00, 18:00)"
     echo "    3) 4x a day (every 6h)              4) custom times, e.g. 07:30,19:30"
-    read -r -u "$TTY_FD" -p "    Choose [1-4]: " v1 || v1=""
+    read -r "${READ_T[@]}" -u "$TTY_FD" -p "    Choose [1-4]: " v1 || v1=""
     case "$v1" in
         2) "$BIN" --schedule "06:00,18:00" | sed 's/^/    /' ;;
         3) "$BIN" --schedule "every 6h" | sed 's/^/    /' ;;
-        4) read -r -u "$TTY_FD" -p "    Times (HH:MM,HH:MM,...) or OnCalendar expression: " v2 || v2=""
+        4) read -r "${READ_T[@]}" -u "$TTY_FD" -p "    Times (HH:MM,HH:MM,...) or OnCalendar expression: " v2 || v2=""
            if [[ -n "$v2" ]]; then "$BIN" --schedule "$v2" | sed 's/^/    /' || echo "    ! invalid schedule; keeping daily 06:00"; fi ;;
         *) echo "    keeping daily 06:00" ;;
     esac
     echo "  Automatic updates from GitHub ($REPO_SLUG)"
-    read -r -u "$TTY_FD" -p "    Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled] " v1 || v1=""
+    read -r "${READ_T[@]}" -u "$TTY_FD" -p "    Enable automatic updates from GitHub? [1=Notify only (default), 2=Auto-install, 3=Disabled] " v1 || v1=""
     case "$v1" in 2) v1=true ;; 3) v1=false ;; *) v1=notify ;; esac
     put AUTO_UPDATE "$v1"
     echo
     echo "Configuration stored encrypted ($("$BIN" --status 2>/dev/null | sed -n 's/^Secrets *: //p'))."
-    read -r -u "$TTY_FD" -p "Send a test notification now (abuse-checker --test-notify)? [y/N] " reply || reply=""
+    read -r "${READ_T[@]}" -u "$TTY_FD" -p "Send a test notification now (abuse-checker --test-notify)? [y/N] " reply || reply=""
     if [[ "$reply" =~ ^[Yy] ]]; then "$BIN" --test-notify || echo "test notification reported errors (see above)"; fi
 }
 
 # Under `curl | sudo bash` stdin is the pipe, so answers are read from the
 # controlling terminal (/dev/tty) instead.
-TTY_FD=0
-if $INTERACTIVE && [[ -t 1 ]]; then
-    if [[ -t 0 ]]; then
-        wizard
-    elif { exec 3</dev/tty; } 2>/dev/null; then
-        TTY_FD=3
-        wizard
-        exec 3<&-
-    fi
+if [[ -n "$TTY_FD" ]]; then
+    wizard
+    [[ "$TTY_FD" == "3" ]] && exec 3<&-
 fi
 
 cat <<MSG

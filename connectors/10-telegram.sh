@@ -18,13 +18,15 @@ connector_send() {
             def e: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
             "🚨 <b>\($t | e)</b>\n<pre>\($b | e)</pre>"')"
     else
-        text="$(jq -r --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --argjson force "$FORCE_FULL" '
+        text="$(jq -r --arg title "$title" --arg upd "${UPDATE_NOTICE:-}" --argjson force "$FORCE_FULL" "$JQ_LIB"'
             def e: tostring | gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
             def icon: {"NEW":"🔴","ESCALATED":"🟠","UNCHANGED":"🟡"}[.status] // "";
             [.[] | select(.status=="NEW" or .status=="ESCALATED" or ($force and .status=="UNCHANGED"))] as $a
             | "<b>\($title|e)</b>\n"
             + "Checked <b>\(length)</b> · New <b>\(map(select(.status=="NEW"))|length)</b> · Escalated <b>\(map(select(.status=="ESCALATED"))|length)</b>\n\n"
-            + ([$a[:25][] | "\(icon) <code>\(.target|e)</code> — \(.score)% · \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n    <i>\(.isp|e)</i>" else "" end)] | join("\n"))
+            + ([$a[:25][] | "\(icon) <code>\(.target|e)</code> — \(.score)% · \(.total) reports" + (if .delta > 0 then " (+\(.delta))" else "" end) + (if (.isp//"") != "" then "\n    <i>\(.isp|e)</i>" else "" end)
+                + (if catlist != "" then "\n    🏷 \(catlist|e)" else "" end)
+                + (if why != "" then "\n    💬 <code>\(why|e)</code>" else "" end)] | join("\n"))
             + (if ($a|length) > 25 then "\n…and \(($a|length) - 25) more (see report)" else "" end)
             + "\n\n<i>\(map(select(.status=="UNCHANGED"))|length) unchanged dirty IP(s) not re-alerted.</i>"
             + (if $upd != "" then "\n⬆️ <i>\($upd|e)</i>" else "" end)' "$data")"
