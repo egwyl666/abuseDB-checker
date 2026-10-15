@@ -6,6 +6,7 @@
 #   sudo ./install.sh [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]
 # One-line mode (downloads the repository tarball itself):
 #   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
+#   sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"   # no curl
 #   curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh | sudo bash   # also works
 #   ... | sudo AC_BRANCH=<branch> bash        # install another branch
 #
@@ -26,24 +27,61 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)" || SRC="$(pwd
 # the tarball, verify it and run its install.sh with the same arguments.
 if [[ ! -f "$SRC/abuse-checker.sh" || ! -d "$SRC/connectors" ]]; then
     [[ -z "${AC_BOOTSTRAPPED:-}" ]] || { echo "error: downloaded archive is incomplete" >&2; exit 1; }
-    # tar/gzip are needed to unpack the archive; install them if absent.
-    if ! command -v tar >/dev/null 2>&1 || ! command -v gzip >/dev/null 2>&1; then
-        echo "==> installing tar/gzip"
-        if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tar gzip
-        elif command -v dnf >/dev/null; then dnf -q -y install tar gzip
-        elif command -v yum >/dev/null; then yum -q -y install tar gzip
-        elif command -v apk >/dev/null; then apk -q add --no-cache tar gzip
-        elif command -v pacman >/dev/null; then pacman -Sy --needed --noconfirm tar gzip
-        elif command -v zypper >/dev/null; then zypper --non-interactive --quiet install tar gzip
-        fi </dev/null || true
+    # Bare-bones systems: curl, ca-certificates, tar and gzip are needed to
+    # fetch and unpack the archive. Install whatever is missing with the
+    # detected package manager; if curl still cannot be had, download with
+    # wget instead (abuse-checker --install-deps adds curl afterwards).
+    # ABUSE_CHECKER_PKG_MGR / _PKG_CMD / _FAKE_MISSING_FILE / _WGET exist for tests.
+    boot_have() {
+        if [[ -n "${ABUSE_CHECKER_FAKE_MISSING_FILE:-}" && -f "$ABUSE_CHECKER_FAKE_MISSING_FILE" ]] \
+           && grep -qx -- "$1" "$ABUSE_CHECKER_FAKE_MISSING_FILE"; then return 1; fi
+        if [[ "$1" == "ca-certificates" ]]; then
+            [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/pki/tls/certs/ca-bundle.crt || -s /etc/ssl/cert.pem ]]
+        else
+            command -v "$1" >/dev/null 2>&1
+        fi
+    }
+    boot_pm() {
+        local pm
+        [[ -n "${ABUSE_CHECKER_PKG_MGR:-}" ]] && { echo "$ABUSE_CHECKER_PKG_MGR"; return 0; }
+        for pm in apt-get dnf yum apk pacman zypper; do command -v "$pm" >/dev/null 2>&1 && { echo "$pm"; return 0; }; done
+        return 1
+    }
+    boot_install() {   # boot_install PKG...
+        local pm bin
+        pm="$(boot_pm)" || { echo "error: no supported package manager to install: $*" >&2; return 1; }
+        bin="${ABUSE_CHECKER_PKG_CMD:-$pm}"
+        echo "==> installing $* with $pm"
+        case "$pm" in
+            apt-get) "$bin" update -qq && env DEBIAN_FRONTEND=noninteractive "$bin" install -y -qq --no-install-recommends "$@" ;;
+            dnf|yum) "$bin" -q -y install "$@" ;;
+            apk) "$bin" -q add --no-cache "$@" ;;
+            pacman) "$bin" -Sy --needed --noconfirm "$@" ;;
+            zypper) "$bin" --non-interactive --quiet install --no-recommends "$@" ;;
+        esac </dev/null
+    }
+    boot_missing=()
+    for t in curl ca-certificates tar gzip; do boot_have "$t" || boot_missing+=("$t"); done
+    if (( ${#boot_missing[@]} > 0 )); then
+        boot_install "${boot_missing[@]}" || echo "warning: could not install ${boot_missing[*]}" >&2
     fi
-    for t in curl tar gzip; do command -v "$t" >/dev/null 2>&1 || { echo "error: '$t' is required" >&2; exit 1; }; done
+    for t in tar gzip; do boot_have "$t" || { echo "error: '$t' is required to unpack the download" >&2; exit 1; }; done
     BOOT="$(mktemp -d "${TMPDIR:-/tmp}/abuse-checker-install.XXXXXX")"
     trap 'rm -rf "$BOOT"' EXIT
     echo "==> downloading $REPO_SLUG@$REPO_BRANCH"
-    printf 'url = "%s"\n' "$ARCHIVE_URL" \
-        | "$CURL" --fail --silent --show-error --location --max-time 120 --config - -o "$BOOT/src.tar.gz" \
-        || { echo "error: download failed: $ARCHIVE_URL" >&2; exit 1; }
+    WGET="${ABUSE_CHECKER_WGET:-wget}"
+    if boot_have curl; then
+        printf 'url = "%s"\n' "$ARCHIVE_URL" \
+            | "$CURL" --fail --silent --show-error --location --max-time 120 --config - -o "$BOOT/src.tar.gz" \
+            || { echo "error: download failed: $ARCHIVE_URL" >&2; exit 1; }
+    elif command -v "$WGET" >/dev/null 2>&1; then
+        echo "==> curl unavailable, downloading with wget (curl is installed with the other dependencies)"
+        "$WGET" -qO "$BOOT/src.tar.gz" --timeout=120 "$ARCHIVE_URL" </dev/null \
+            || { echo "error: download failed: $ARCHIVE_URL" >&2; exit 1; }
+    else
+        echo "error: neither curl nor wget is available and curl could not be installed" >&2
+        exit 1
+    fi
     tar -xzf "$BOOT/src.tar.gz" -C "$BOOT" </dev/null || { echo "error: cannot extract archive" >&2; exit 1; }
     BOOT_SRC="$(find "$BOOT" -mindepth 2 -maxdepth 2 -name install.sh -printf '%h\n' | head -n1)"
     [[ -n "$BOOT_SRC" ]] || { echo "error: install.sh not found in archive" >&2; exit 1; }

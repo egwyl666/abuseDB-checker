@@ -84,7 +84,7 @@ report_file() { echo "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date '+%Y-%m-%d'
 
 # ---------------------------------------------------------------------------
 section "Static checks"
-for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh tests/mock_systemctl.sh tests/mock_journalctl.sh tests/mock_pkg.sh \
+for f in abuse-checker.sh install.sh uninstall.sh tests/run_tests.sh tests/mock_curl.sh tests/mock_systemctl.sh tests/mock_journalctl.sh tests/mock_pkg.sh tests/mock_wget.sh \
          connectors/10-telegram.sh connectors/20-slack.sh connectors/30-email.sh connectors/40-jira.sh connectors/99-custom.sh.example; do
     if bash -n "$ROOT/$f" 2>/dev/null; then ok "bash -n $f"; else bad "bash -n $f"; fi
     if command -v shellcheck >/dev/null 2>&1; then
@@ -980,6 +980,44 @@ check "bootstrap rejects corrupted archive" bash -c '[[ $1 -ne 0 ]] && grep -q "
 BOOT_OUT="$(cd "$WORK/elsewhere" && ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 bash < "$ROOT/install.sh" 2>&1)"; RC=$?
 check "bootstrap reports download failure" bash -c '[[ $1 -ne 0 ]] && grep -q "download failed" <<< "$2"' _ "$RC" "$BOOT_OUT"
 check "bootstrap leaves no temp dirs" test -z "$(ls -A "$TMPDIR")"
+
+section "Bootstrap on a bare system without curl"
+boot() { (cd "$WORK/elsewhere" && ABUSE_CHECKER_BOOTSTRAP_DRYRUN=1 ABUSE_CHECKER_PKG_CMD="$HERE/mock_pkg.sh" \
+          ABUSE_CHECKER_FAKE_MISSING_FILE="$WORK/fake_missing" "$@" bash < "$ROOT/install.sh" 2>&1); }
+printf 'curl\nca-certificates\n' > "$WORK/fake_missing"; : > "$MOCK_LOG/pkg.log"; : > "$MOCK_LOG/update.log"
+BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_TARBALL="$WORK/rel/good.tar.gz")"; RC=$?
+check "no curl: installs curl + ca-certificates first (apt-get)" grep -qx "install -y -qq --no-install-recommends curl ca-certificates" "$MOCK_LOG/pkg.log"
+check "no curl: refreshes package metadata" grep -qx "update -qq" "$MOCK_LOG/pkg.log"
+check "no curl: then downloads with curl and verifies" bash -c '[[ $1 -eq 0 ]] && grep -q "bootstrap verified" <<< "$2" && grep -q "archive/refs/heads/main.tar.gz" "$3"' _ "$RC" "$BOOT_OUT" "$MOCK_LOG/update.log"
+for pm in dnf yum apk pacman zypper; do
+    printf 'curl\ntar\ngzip\n' > "$WORK/fake_missing"; : > "$MOCK_LOG/pkg.log"
+    BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=$pm MOCK_TARBALL="$WORK/rel/good.tar.gz")"; RC=$?
+    case $pm in
+        dnf|yum) want="-q -y install curl tar gzip" ;;
+        apk) want="-q add --no-cache curl tar gzip" ;;
+        pacman) want="-Sy --needed --noconfirm curl tar gzip" ;;
+        zypper) want="--non-interactive --quiet install --no-recommends curl tar gzip" ;;
+    esac
+    check "no curl/tar/gzip with $pm: '$want'" bash -c '[[ $1 -eq 0 ]] && grep -qxF -- "$2" "$3"' _ "$RC" "$want" "$MOCK_LOG/pkg.log"
+done
+printf 'curl\n' > "$WORK/fake_missing"; : > "$MOCK_LOG/update.log"
+BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_PKG_FAIL=1 ABUSE_CHECKER_WGET="$HERE/mock_wget.sh" MOCK_TARBALL="$WORK/rel/good.tar.gz")"; RC=$?
+check "curl install fails -> falls back to wget" bash -c '[[ $1 -eq 0 ]] && grep -q "downloading with wget" <<< "$2" && grep -q "^wget https://github.test/owner/repo/archive/refs/heads/main.tar.gz" "$3"' _ "$RC" "$BOOT_OUT" "$MOCK_LOG/update.log"
+check "wget path still verifies the archive" grep -q "bootstrap verified" <<< "$BOOT_OUT"
+BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_PKG_FAIL=1 ABUSE_CHECKER_WGET="$HERE/mock_wget.sh" MOCK_TARBALL="$WORK/rel/badscript.tar.gz")"; RC=$?
+check "wget path rejects a corrupted archive" bash -c '[[ $1 -ne 0 ]] && grep -q "syntax check failed" <<< "$2"' _ "$RC" "$BOOT_OUT"
+BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_PKG_FAIL=1 ABUSE_CHECKER_WGET=/nonexistent/wget)"; RC=$?
+check "no curl, no wget, install fails -> clear error" bash -c '[[ $1 -ne 0 ]] && grep -q "neither curl nor wget is available" <<< "$2"' _ "$RC" "$BOOT_OUT"
+: > "$WORK/fake_missing"; : > "$MOCK_LOG/pkg.log"
+BOOT_OUT="$(boot env ABUSE_CHECKER_PKG_MGR=apt-get MOCK_TARBALL="$WORK/rel/good.tar.gz")"
+check "everything present -> no package manager calls" test ! -s "$MOCK_LOG/pkg.log"
+check "bootstrap tests leave no temp dirs" test -z "$(ls -A "$TMPDIR")"
+for rd in README.md README.uk.md; do
+    UNI="$(awk '/^sudo sh -c '"'"'u=https/{f=1} f{print} f&&/fi'"'"'$/{exit}' "$ROOT/$rd")"
+    check "$rd: universal no-curl command is valid sh" bash -c '[[ -n "$1" ]] && sh -n <<< "${1#sudo }"' _ "$UNI"
+    check "$rd: universal command tries curl, then wget, then installs curl" bash -c 'grep -q "command -v curl" <<< "$1" && grep -q "wget -qO-" <<< "$1" && grep -q "apt-get install -y -qq curl" <<< "$1" && grep -q "pacman -Sy" <<< "$1"' _ "$UNI"
+    check "$rd: wget one-liner" grep -qF 'sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"' "$ROOT/$rd"
+done
 check "wizard reads answers from /dev/tty" grep -q 'exec 3</dev/tty' "$ROOT/install.sh"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

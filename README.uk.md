@@ -216,12 +216,48 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-ch
 sudo AC_BRANCH=dev bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
+### Без curl (wget або мінімальна система)
+
+Замість `curl` можна використати `wget`:
+
+```bash
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
+```
+
+Самому інсталятору, крім `bash`, нічого не потрібно. Перед завантаженням
+архіву проєкту він встановлює відсутні `curl`, `ca-certificates`, `tar` і
+`gzip` через виявлений пакетний менеджер (`apt-get`, `dnf`, `yum`, `apk`,
+`pacman`, `zypper`). Якщо `curl` усе одно не вдається встановити, архів
+завантажується через `wget`, а `curl` додається пізніше разом з іншими
+залежностями.
+
+**Універсальна команда для мінімальних образів.** Вона використовує `curl`,
+якщо він є, потім `wget`, а якщо немає жодного, спочатку встановлює `curl`
+через пакетний менеджер. Вставляйте як є, переноси рядків усередині лапок:
+
+```bash
+sudo sh -c 'u=https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh
+if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL "$u")
+elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- "$u")
+else
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then dnf -y -q install curl ca-certificates
+  elif command -v yum >/dev/null 2>&1; then yum -y -q install curl ca-certificates
+  elif command -v apk >/dev/null 2>&1; then apk add -q --no-cache curl ca-certificates bash
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm --needed curl ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then zypper -n -q install curl ca-certificates
+  fi >/dev/null 2>&1
+  s=$(curl -fsSL "$u")
+fi
+if [ -n "$s" ]; then bash -c "$s"; else echo "abuse-checker: could not download install.sh" >&2; exit 1; fi'
+```
+
 Якщо хочете спочатку переглянути скрипт:
 `curl -fsSLO https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh && less install.sh && sudo bash install.sh`.
 
 ### Із git clone
 
-Вимоги: Linux із systemd, `bash` 4.4+ і `curl`. Решта (`jq`, `gawk`, `sed`,
+Вимоги: Linux із systemd і `bash` 4.4+. Решта (`curl`, `jq`, `gawk`, `sed`,
 `openssl`, `flock` з util-linux, coreutils, findutils, `tar`,
 `ca-certificates`) **встановлюється автоматично**, якщо її немає, через
 `apt-get`, `dnf`, `yum`, `apk`, `pacman` або `zypper`. systemd 250+
@@ -995,6 +1031,7 @@ bash tests/run_tests.sh          # KEEP_WORK=1 зберігає тимчасов
 | `invalid OnCalendar expression` | Перевірте вираз через `systemd-analyze calendar '<вираз>'` або використайте одну з готових специфікацій. |
 | Надійшло `[WATCHDOG ALERT]` | Сервіс тричі впав за 15 хвилин або завис. Перегляньте рядки логу в сповіщенні та `journalctl -u abuse-checker -n 100`. Відновлення вже виконано, і наступний запуск за таймером спробує знову. |
 | `start request repeated too quickly` | Досягнуто ліміту запусків (3 за 15 хвилин). Watchdog скидає його; також можна виконати `sudo systemctl reset-failed abuse-checker`. |
+| `bash: curl: command not found` | Використайте команду з `wget` або універсальну команду з розділу [Без curl](#без-curl-wget-або-мінімальна-система). |
 | Інсталятор однією командою зупиняється на запитанні й не реагує на введення | Ви використали `curl ... \| sudo bash` зі старішим інсталятором (1.4.0 або раніше). Встановлення вже завершено, тож натисніть Ctrl+C. Наступного разу використовуйте `sudo bash -c "$(curl -fsSL ...install.sh)"`; починаючи з 1.5.0 варіант із каналом більше не блокується. |
 | `missing dependencies: ... (run: sudo abuse-checker --doctor)` | Виконайте `sudo abuse-checker --doctor`, він встановить відсутнє. Якщо не вдається, перегляньте помилку пакетного менеджера (недоступне дзеркало, зафіксовані пакети). |
 | `--doctor`: `cannot reach https://api.abuseipdb.com` | Вихідний HTTPS блокують DNS, фаєрвол чи проксі. Перевірте через `curl -sI https://api.abuseipdb.com`. |

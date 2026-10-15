@@ -208,13 +208,49 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-ch
 sudo AC_BRANCH=dev bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
 ```
 
+### Without curl (wget, or a bare-bones system)
+
+Use `wget` instead of `curl`:
+
+```bash
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"
+```
+
+The installer itself needs nothing beyond `bash`. Before downloading the
+project archive, it installs any missing `curl`, `ca-certificates`, `tar` and
+`gzip` with the detected package manager (`apt-get`, `dnf`, `yum`, `apk`,
+`pacman`, `zypper`). If `curl` still cannot be installed, it downloads the
+archive with `wget` and adds `curl` later together with the other
+dependencies.
+
+**Universal command for minimal images.** It uses `curl` if present, then
+`wget`, and if neither exists it first installs `curl` with the package
+manager. Paste it as is; the line breaks are inside the quotes:
+
+```bash
+sudo sh -c 'u=https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh
+if command -v curl >/dev/null 2>&1; then s=$(curl -fsSL "$u")
+elif command -v wget >/dev/null 2>&1; then s=$(wget -qO- "$u")
+else
+  if command -v apt-get >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then dnf -y -q install curl ca-certificates
+  elif command -v yum >/dev/null 2>&1; then yum -y -q install curl ca-certificates
+  elif command -v apk >/dev/null 2>&1; then apk add -q --no-cache curl ca-certificates bash
+  elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm --needed curl ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then zypper -n -q install curl ca-certificates
+  fi >/dev/null 2>&1
+  s=$(curl -fsSL "$u")
+fi
+if [ -n "$s" ]; then bash -c "$s"; else echo "abuse-checker: could not download install.sh" >&2; exit 1; fi'
+```
+
 If you prefer to read the script first:
 `curl -fsSLO https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh && less install.sh && sudo bash install.sh`.
 
 ### From a git clone
 
-Requirements: a systemd-based Linux with `bash` 4.4+ and `curl`. Everything
-else (`jq`, `gawk`, `sed`, `openssl`, `flock` from util-linux, coreutils,
+Requirements: a systemd-based Linux with `bash` 4.4+. Everything
+else (`curl`, `jq`, `gawk`, `sed`, `openssl`, `flock` from util-linux, coreutils,
 findutils, `tar`, `ca-certificates`) is **installed automatically** if
 missing, using `apt-get`, `dnf`, `yum`, `apk`, `pacman` or `zypper`.
 systemd 250+ is used automatically when available.
@@ -952,6 +988,7 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `invalid OnCalendar expression` | Test the expression with `systemd-analyze calendar '<expr>'`, or use one of the presets. |
 | `[WATCHDOG ALERT]` received | The service failed 3 times within 15 minutes, or hung. Read the log lines in the alert and `journalctl -u abuse-checker -n 100`. Recovery has already run, and the next timer run retries. |
 | `start request repeated too quickly` | The start limit (3 per 15 minutes) was hit. The watchdog resets it, or run `sudo systemctl reset-failed abuse-checker`. |
+| `bash: curl: command not found` | Use the `wget` command or the universal command from [Without curl](#without-curl-wget-or-a-bare-bones-system). |
 | One-line installer stops at a question and does not react to input | You used `curl ... \| sudo bash` with an older installer (1.4.0 or earlier). Installation was already finished, so press Ctrl+C. Use `sudo bash -c "$(curl -fsSL ...install.sh)"` next time; from 1.5.0 the pipe form no longer blocks. |
 | `missing dependencies: ... (run: sudo abuse-checker --doctor)` | Run `sudo abuse-checker --doctor`; it installs what is missing. If that fails, check the package manager's error (offline mirror, held packages). |
 | `--doctor`: `cannot reach https://api.abuseipdb.com` | DNS, firewall or proxy is blocking outbound HTTPS. Test with `curl -sI https://api.abuseipdb.com`. |
