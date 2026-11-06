@@ -856,6 +856,82 @@ check "install.sh: piped, no foreground tty -> defaults, no hang" bash -c 'out="
 check "README recommends sudo bash -c \"\$(curl ...)\"" grep -q '^sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/egwyl666/abuseDB-checker/main/install.sh)"$' "$ROOT/README.md"
 
 # ---------------------------------------------------------------------------
+section "Telegram: several bots, each writes only to its own chat IDs"
+setup_env
+TG2="987654321:BBsecondBotTokenForSocTeam_000000000"
+TG3="555555555:CCthirdBotTokenNoChats_1111111111111"
+cat >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf" <<TGCONF
+TELEGRAM_BOT_TOKEN_2="$TG2"
+TELEGRAM_CHAT_IDS_2="-1003333333333, 444444444, 111, not-an-id, @soc_alerts, 12ab"
+TELEGRAM_BOT_TOKEN_3="$TG3"
+TELEGRAM_CHAT_IDS_3=""
+TELEGRAM_CHAT_IDS_4="777777777"
+TELEGRAM_BOT_TOKEN_5="garbage-token"
+TELEGRAM_CHAT_IDS_5="888888888"
+TGCONF
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+msgs() { grep -o "api.telegram.org/bot[^/]*/sendMessage" "$MOCK_LOG/notify.log" | wc -l; }
+sent_to() { awk -v b="$1" -v c="$2" '/^url = "https:\/\/api.telegram.org\/bot/ {u=$0} $0 == "form-string = \"chat_id=" c "\"" && index(u, "bot" b "/sendMessage") {n++} END {print n+0}' "$MOCK_LOG/config.log"; }
+check "tg: bot #1 -> its chats (111, -100222)" bash -c '[[ $1 == 1 && $2 == 1 ]]' _ "$(sent_to "$TG_TOKEN" 111)" "$(sent_to "$TG_TOKEN" -100222)"
+check "tg: bot #2 -> -1003333333333" test "$(sent_to "$TG2" -1003333333333)" = 1
+check "tg: bot #2 -> 444444444" test "$(sent_to "$TG2" 444444444)" = 1
+check "tg: bot #2 -> @soc_alerts (public channel)" test "$(sent_to "$TG2" @soc_alerts)" = 1
+check "tg: chat 111 listed for bots #1 and #2 gets ONE message" bash -c '[[ $1 == 1 && $2 == 0 ]]' _ "$(sent_to "$TG_TOKEN" 111)" "$(sent_to "$TG2" 111)"
+check "tg: duplicate logged by bot number" grep -q "Telegram bot #2: chat 111 already served by bot #1; not sent twice" <<< "$OUT"
+check "tg: invalid chat ids rejected before sending" bash -c 'grep -q "bot #2: invalid chat id .not-an-id. skipped" <<< "$1" && grep -q "bot #2: invalid chat id .12ab. skipped" <<< "$1" && ! grep -q "chat_id=not-an-id\|chat_id=12ab" "$2"' _ "$OUT" "$MOCK_LOG/config.log"
+check "tg: bot #3 without chats writes to nobody" bash -c 'grep -q "Telegram bot #3: TELEGRAM_BOT_TOKEN_3 is set but TELEGRAM_CHAT_IDS_3 is empty; it writes to nobody" <<< "$1" && ! grep -qF "$2" "$3"' _ "$OUT" "$TG3" "$MOCK_LOG/notify.log"
+check "tg: chats #4 without a token skipped" bash -c 'grep -q "Telegram bot #4: TELEGRAM_CHAT_IDS_4 is set but TELEGRAM_BOT_TOKEN_4 is empty; skipped" <<< "$1" && ! grep -q "chat_id=777777777" "$2"' _ "$OUT" "$MOCK_LOG/config.log"
+check "tg: malformed token #5 skipped" bash -c 'grep -q "Telegram bot #5: token does not look like" <<< "$1" && ! grep -q "chat_id=888888888" "$2"' _ "$OUT" "$MOCK_LOG/config.log"
+check "tg: exactly 5 messages (2 + 3 chats)" test "$(msgs)" = 5
+check "tg: report document sent with each message" test "$(grep -c '/sendDocument' "$MOCK_LOG/notify.log")" = 5
+check "tg: no token in argv" bash -c '! grep -qF -e "$1" -e "$2" -e "$3" "$4"' _ "$TG_TOKEN" "$TG2" "$TG3" "$MOCK_LOG/argv.log"
+check "tg: no token in logs (incl. bot #2/#3, _N names redacted)" bash -c '! grep -qF -e "$1" -e "$2" -e "$3" <<< "$4"' _ "$TG_TOKEN" "$TG2" "$TG3" "$OUT"
+setup_env
+sed -i '/^TELEGRAM_/d' "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+printf 'TELEGRAM_BOT_TOKEN_2="%s"\nTELEGRAM_CHAT_IDS_2="444444444"\n' "$TG2" >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "tg: works with only a numbered pair (no base pair)" test "$(sent_to "$TG2" 444444444)" = 1
+setup_env
+printf 'TELEGRAM_CHAT_IDS="abc,-x"\n' >> "$ABUSE_CHECKER_CONF_DIR/secrets.conf"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "tg: only invalid ids -> connector reports failure, run still rc 0" bash -c '[[ $1 -eq 0 ]] && grep -q "Telegram: no valid bot/chat pairs; nothing sent" <<< "$2" && grep -q "connector 10-telegram failed" <<< "$2"' _ "$RC" "$OUT"
+
+section "Dry-run report is clearly marked as mock data"
+setup_env
+run_checker --dry-run
+DR="$ABUSE_CHECKER_STATE_DIR/reports/report_$(date +%F)_dryrun.html"
+check "dry-run: console warning" grep -q "DRY RUN: scores below are MOCK data generated locally, NOT real AbuseIPDB results" <<< "$OUT"
+check "dry-run: banner in report" grep -q 'class="mock"><b>DRY RUN &mdash; MOCK DATA, NOT REAL ABUSEIPDB RESULTS.</b>' "$DR"
+check "dry-run: page title marked" grep -q '<title>\[DRY RUN - MOCK DATA\] ' "$DR"
+check "dry-run: heading marked" grep -q '<h1>\[DRY RUN - MOCK DATA\] AbuseIPDB report' "$DR"
+run_checker --test-notify
+check "test-notify sample report also marked" grep -q 'class="mock"' "$ABUSE_CHECKER_STATE_DIR/reports/report_$(date +%F)_test.html"
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+run_checker --run
+check "real run: no mock banner" bash -c '! grep -q "class=\"mock\"" "$1" && ! grep -q "DRY RUN" "$1"' _ "$(report_file)"
+
+section "Runs as root keep state owned by the service user"
+setup_env
+fix_ip 192.0.2.2 55 5 "2026-10-10T10:00:00+00:00"
+ABUSE_CHECKER_SERVICE_USER=nobody run_checker --run
+check "root run: state.json owned by service user" test "$(stat -c %U "$ABUSE_CHECKER_STATE_DIR/state.json")" = nobody
+check "root run: report owned by service user" test "$(stat -c %U "$(report_file)")" = nobody
+check "root run: reports dir owned by service user" test "$(stat -c %U "$ABUSE_CHECKER_STATE_DIR/reports")" = nobody
+ABUSE_CHECKER_SERVICE_USER=nobody run_checker --reset-state
+check "reset-state as root: state owned by service user" test "$(stat -c %U "$ABUSE_CHECKER_STATE_DIR/state.json")" = nobody
+ABUSE_CHECKER_SERVICE_USER=nobody run_checker --run
+cp "$ABUSE_CHECKER_STATE_DIR/state.json" "$WORK/state.keep"
+chown root:root "$ABUSE_CHECKER_STATE_DIR/state.json"; chmod 600 "$ABUSE_CHECKER_STATE_DIR/state.json"
+chmod 777 "$ABUSE_CHECKER_STATE_DIR"; chmod 755 "$WORK" "$WORK/env"
+OUT="$(su nobody -s /bin/bash -c "env ABUSE_CHECKER_CONF_DIR='$ABUSE_CHECKER_CONF_DIR' ABUSE_CHECKER_STATE_DIR='$ABUSE_CHECKER_STATE_DIR' ABUSE_CHECKER_CURL='$ABUSE_CHECKER_CURL' ABUSE_CHECKER_CONNECTORS_DIR='$ABUSE_CHECKER_CONNECTORS_DIR' ABUSE_CHECKER_CRYPTO=openssl MOCK_FIX='$MOCK_FIX' MOCK_LOG=/tmp TMPDIR=/tmp IPS_FILE='$ABUSE_CHECKER_CONF_DIR/ips.txt' ABUSEIPDB_API_KEYS='$KEY_GOOD' bash '$SCRIPT' --run" 2>&1)"; RC=$?
+check "unreadable state: run stops with a clear message" bash -c '[[ $1 -ne 0 ]] && grep -q "cannot read .*state.json (owner root:root); fix with: sudo abuse-checker --doctor" <<< "$2"' _ "$RC" "$OUT"
+check "unreadable state: history NOT wiped" cmp -s "$ABUSE_CHECKER_STATE_DIR/state.json" "$WORK/state.keep"
+chmod 750 "$ABUSE_CHECKER_STATE_DIR"; chmod 700 "$WORK"
+
+# ---------------------------------------------------------------------------
 section "Self-update: --check-update / --update / AUTO_UPDATE"
 setup_env
 CUR_VER="$(sed -n 's/^readonly AC_VERSION="\(.*\)"$/\1/p' "$SCRIPT")"

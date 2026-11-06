@@ -275,7 +275,19 @@ wizard() {
     ask v1 "API key(s), comma-separated" silent; put ABUSEIPDB_API_KEYS "$v1"
     echo "  2/5 Telegram connector"
     ask v1 "Bot token (from @BotFather)" silent
-    if [[ -n "$v1" ]]; then ask v2 "Chat IDs, comma-separated (groups start with -100)"; put TELEGRAM_BOT_TOKEN "$v1"; put TELEGRAM_CHAT_IDS "$v2"; fi
+    if [[ -n "$v1" ]]; then
+        ask v2 "Chat IDs this bot may write to, comma-separated (groups start with -100)"; put TELEGRAM_BOT_TOKEN "$v1"; put TELEGRAM_CHAT_IDS "$v2"
+        local n=2
+        while (( n <= 9 )); do
+            read -r "${READ_T[@]}" -u "$TTY_FD" -p "    Add another Telegram bot (bot #$n) with its own recipients? [y/N] " v3 || v3=""
+            [[ "$v3" =~ ^[Yy] ]] || break
+            ask v1 "Bot #$n token" silent
+            [[ -n "$v1" ]] || break
+            ask v2 "Chat IDs for bot #$n only, comma-separated"
+            put "TELEGRAM_BOT_TOKEN_$n" "$v1"; put "TELEGRAM_CHAT_IDS_$n" "$v2"
+            n=$((n + 1))
+        done
+    fi
     echo "  3/5 Slack connector"
     ask v1 "Incoming webhook URL(s), comma-separated" silent; put SLACK_WEBHOOK_URLS "$v1"
     echo "  4/5 Email connector"
