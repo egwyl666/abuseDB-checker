@@ -348,6 +348,7 @@ editor refuses anything else.
 | `REPO_SLUG` / `REPO_BRANCH` | `egwyl666/abuseDB-checker` / `main` | Source for `--check-update` and `--update`         |
 | `TELEGRAM_BOT_TOKEN`  | –               | Bot token from @BotFather                                        |
 | `TELEGRAM_CHAT_IDS`   | –               | Comma-separated chat ids (DMs and groups; groups are negative)   |
+| `TELEGRAM_BOT_TOKEN_N` / `TELEGRAM_CHAT_IDS_N` | – | Extra bots (`N` = 2, 3, ...), each writing only to its own chat IDs |
 | `SLACK_WEBHOOK_URLS`  | –               | Comma-separated incoming webhook URLs                            |
 | `EMAIL_TO`            | –               | Comma-separated recipients                                       |
 | `EMAIL_FROM`          | `abuse-checker@<host>` | Sender address                                            |
@@ -450,6 +451,30 @@ from the list. To add a new channel type, see [Connectors](#connectors).
   `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser (never paste the
   token into a shell history on a shared host). Each chat receives an HTML
   summary (`sendMessage`) and the report as a file (`sendDocument`).
+
+  **Several bots, each with its own recipients.** Add numbered pairs. Bot N
+  writes **only** to the chat IDs in `TELEGRAM_CHAT_IDS_N`:
+
+  ```bash
+  TELEGRAM_BOT_TOKEN="111:AAA..."           # bot #1
+  TELEGRAM_CHAT_IDS="123456789"             #   writes only here
+  TELEGRAM_BOT_TOKEN_2="222:BBB..."         # bot #2, e.g. the SOC team
+  TELEGRAM_CHAT_IDS_2="-1003333333333,@soc_alerts"
+  ```
+
+  - **Chat IDs are checked before anything is sent.** Only numeric IDs
+    (`123456789`, `-100…`) and `@public_channel` names are accepted. Anything
+    else, for example a typo like `12ab`, is skipped with a warning that
+    names the bot by number, never by token.
+  - **Incomplete pairs are skipped.** A token without chat IDs writes to
+    nobody, a chat list without a token is skipped, and a token that does
+    not look like `<digits>:<secret>` is skipped. Each case logs a warning.
+  - **No duplicates.** A chat listed for two bots gets the alert once, from
+    the lower-numbered bot.
+  - **The bot never reads incoming messages.** Strangers who write to it
+    get nothing back.
+  - **Tokens stay secret.** All tokens, `_2`, `_3` and so on included, go to
+    curl only through stdin and are redacted from logs.
 - **Slack:** create one *Incoming Webhook* per channel or workspace and add
   every URL to `SLACK_WEBHOOK_URLS`. Messages use Block Kit and include a
   button per IP.
@@ -542,7 +567,7 @@ own subshell**, so one failing connector cannot stop the others or the run.
 
 | File | Settings |
 |------|----------|
-| `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS` |
+| `10-telegram.sh` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_IDS`, plus `TELEGRAM_BOT_TOKEN_N` / `TELEGRAM_CHAT_IDS_N` for more bots |
 | `20-slack.sh` | `SLACK_WEBHOOK_URLS` |
 | `30-email.sh` | `EMAIL_TO`, `EMAIL_FROM`, `SMTP_URL`, `SMTP_USER`, `SMTP_PASS` |
 | `40-jira.sh` | `JIRA_BASE_URL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (required), plus `JIRA_USER_EMAIL`, `JIRA_ISSUE_TYPE`, `JIRA_UPDATE_MODE`, `JIRA_LABELS`, `JIRA_PRIORITY`, `JIRA_ATTACH_REPORT` |
@@ -636,7 +661,7 @@ abuse-checker [--doctor | --check-system | --install-deps] [--upgrade-os]
 | Flag                  | Effect |
 |-----------------------|--------|
 | `--run`               | Default. Run the check, update state, alert on `NEW`/`ESCALATED`. |
-| `--dry-run`           | Use built-in mock API responses and a separate `state.dryrun.json`. Writes `report_<date>_dryrun.html`. Sends no notifications and makes no network calls. Uses the sample targets if `ips.txt` is not readable. |
+| `--dry-run`           | Use built-in mock API responses and a separate `state.dryrun.json`. Writes `report_<date>_dryrun.html`, marked with a red **DRY RUN — MOCK DATA** banner and title, and prints the same warning to the console. **The scores are invented, not real AbuseIPDB results.** For a real check, run `sudo systemctl start abuse-checker.service`. Sends no notifications and makes no network calls. Uses the sample targets if `ips.txt` is not readable. |
 | `--test-notify`       | Build a sample report (`report_<date>_test.html`) and send it to every configured channel. Does not touch the state. |
 | `--force-full-report` | Normal run, but alerts on **every** dirty IP, including `UNCHANGED` ones. |
 | `--status`            | Shows tracked IPs, dirty/clean counts, last run, report count, number of keys, the secrets store, the active connectors and the next timer trigger. |
@@ -1000,6 +1025,9 @@ directories at a temporary directory (`ABUSE_CHECKER_CONF_DIR`,
 | `API key #N rate-limited (HTTP 429)` | The daily quota is used up. Add more keys, set `REQUEST_DELAY`, or use `check-block` for ranges. |
 | `API key #N rejected (HTTP 401/403)` | The key is invalid or revoked. |
 | Only `ERROR` rows | Check outbound HTTPS (`curl -sI https://api.abuseipdb.com`), DNS, and the service's `RestrictAddressFamilies`. |
+| Clean IPs are "dirty" after `--dry-run` | Expected: `--dry-run` uses invented mock data (see the red banner in the report). Run a real check with `sudo systemctl start abuse-checker.service`, then `sudo abuse-checker --list-ips`. |
+| `cannot read .../state.json (owner root:root)` | An older version run as root left the state file owned by root. Run `sudo abuse-checker --doctor` to fix the owner. Since 1.6.0, runs as root keep state and reports owned by `abusechecker`. |
+| `Telegram bot #N: invalid chat id ... skipped` | Fix that ID in `TELEGRAM_CHAT_IDS_N`: use a numeric ID or `@channel`. |
 | Telegram `sendMessage ... failed` | The bot is not in the group or was never started in the DM, or the chat id is wrong. Groups need the `-100...` id. |
 | Slack `webhook #N failed` | The webhook was revoked or the channel was archived. Regenerate the webhook. |
 | Email not delivered | Check `SMTP_URL`, the port and the credentials. For Gmail, use an app password. Without `SMTP_URL`, a working local `sendmail` is required. |

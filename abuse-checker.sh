@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.5.0"
+readonly AC_VERSION="1.6.0"
 # Upstream repository used by --check-update / --update (override with
 # REPO_SLUG / REPO_BRANCH in the secrets store).
 readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"
@@ -19,7 +19,7 @@ STATE_DIR="${ABUSE_CHECKER_STATE_DIR:-/var/lib/abuse-checker}"
 CURL_BIN="${ABUSE_CHECKER_CURL:-curl}"
 IPS_FILE="${IPS_FILE:-$CONF_DIR/ips.txt}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/state.json}"
-SERVICE_USER="abusechecker"
+SERVICE_USER="${ABUSE_CHECKER_SERVICE_USER:-abusechecker}"
 
 TMPD=""
 RAM_FILES=()
@@ -446,11 +446,25 @@ new_state() {
                  end))}' "$1"
 }
 
+# Files under STATE_DIR always belong to the service user, even when a
+# command runs as root (e.g. `sudo abuse-checker --run`); otherwise the
+# next scheduled run could not read its own state.
+own_state_file() {
+    [[ $EUID -eq 0 ]] || return 0
+    id "$SERVICE_USER" >/dev/null 2>&1 || return 0
+    case "$1" in "$STATE_DIR"/*) chown "$SERVICE_USER:" "$1" 2>/dev/null || true ;; esac
+}
+
 ensure_state() {
     local f="$1"
+    if [[ -e "$f" && ! -r "$f" ]]; then
+        # Never wipe history just because we cannot read it.
+        die "cannot read $f (owner $(stat -c %U:%G "$f" 2>/dev/null)); fix with: sudo abuse-checker --doctor"
+    fi
     if [[ ! -s "$f" ]] || ! jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
         [[ -s "$f" ]] && warn "state file $f is corrupt; starting fresh"
         echo '{"version":1,"lastRun":null,"ips":{}}' > "$f"
+        own_state_file "$f"
     fi
 }
 
@@ -460,6 +474,7 @@ write_atomic() {
     cat "$src" > "$tmp"
     chmod 0640 "$tmp"
     mv -f "$tmp" "$dest"
+    own_state_file "$dest"
 }
 
 # ---------------------------------------------------------------------------
@@ -521,14 +536,18 @@ render_report() {
             + "</summary>" + (if .kind == "cidr" then cidrdetail else ipdetail end) + "</details></td></tr>"
            else "" end)
     ' "$data")"
-    local upd_html=""
+    local upd_html="" mock_html="" mock_title=""
+    if $DRY_RUN; then
+        mock_title="[DRY RUN - MOCK DATA] "
+        mock_html="<div class=\"mock\"><b>DRY RUN &mdash; MOCK DATA, NOT REAL ABUSEIPDB RESULTS.</b> Every score, report and comment on this page was generated locally to test the program; AbuseIPDB was not contacted. Run a real check with <code>sudo systemctl start abuse-checker.service</code>.</div>"
+    fi
     # (patsub_replacement: a bare & in the replacement means "the match")
     [[ -n "${UPDATE_NOTICE:-}" ]] && upd_html="<div class=\"upd\">${UPDATE_NOTICE//>/\&gt;}</div>"
     cat > "$out" <<HTML
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Abuse report ${HOST_LABEL} ${suffix}</title>
+<title>${mock_title}Abuse report ${HOST_LABEL} ${suffix}</title>
 <style>
 :root{--bg:#f5f6f8;--fg:#1d2330;--card:#fff;--mut:#6b7280;--line:#e5e7eb}
 @media (prefers-color-scheme:dark){:root{--bg:#11151c;--fg:#e5e7eb;--card:#1a202b;--mut:#9ca3af;--line:#2a3140}}
@@ -547,6 +566,7 @@ th{cursor:pointer;user-select:none;font-size:12px;text-transform:uppercase;color
 .s-hi{background:#b91c1c}.s-md{background:#ea580c}.s-lo{background:#ca8a04}.s-0{background:#16a34a}.d{background:#dc2626}.dn{background:#6b7280}
 .btn{display:inline-block;padding:4px 10px;border-radius:6px;background:#2563eb;color:#fff;text-decoration:none;font-size:12px}
 footer{color:var(--mut);margin-top:12px;font-size:12px}
+.mock{margin:0 0 14px;padding:12px 14px;border:2px dashed #b91c1c;border-radius:10px;background:#fee2e2;color:#7f1d1d;font-size:14px}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.bar input{margin:0;flex:1}
 #xa{padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer}
 .cat{display:inline-block;padding:1px 6px;margin:1px 0;border-radius:4px;font-size:11px;background:#e0e7ff;color:#3730a3;white-space:nowrap}
@@ -556,7 +576,8 @@ table.sub{min-width:0;font-size:12px;background:var(--bg);border-radius:6px}tabl
 pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace}.nw{white-space:nowrap}
 .upd{margin-top:12px;padding:8px 12px;border-radius:8px;background:#fef3c7;color:#92400e;font-size:13px}
 </style></head><body>
-<h1>AbuseIPDB report &mdash; ${HOST_LABEL} ${suffix}</h1>
+${mock_html}
+<h1>${mock_title}AbuseIPDB report &mdash; ${HOST_LABEL} ${suffix}</h1>
 <div class="sub">Generated ${now} &middot; threshold ${THRESHOLD}% &middot; window ${MAX_AGE_DAYS} days</div>
 <div class="cards">
 <div class="c"><b>${total}</b><span>Total checked</span></div>
@@ -585,6 +606,7 @@ rows.sort(function(x,y){var a=k(x),c=k(y);return (a>c?1:a<c?-1:0)*(asc?1:-1)});a
 </script></body></html>
 HTML
     chmod 0640 "$out"
+    own_state_file "$out"
 }
 
 prune_reports() {
@@ -1771,6 +1793,7 @@ cmd_run() {
     local results classified newstate report today state_file count_alert suffix=""
     [[ -d "$STATE_DIR" ]] || die "state directory $STATE_DIR does not exist (run install.sh)"
     mkdir -p "$REPORT_DIR"
+    own_state_file "$REPORT_DIR"
     acquire_lock
     state_file="$STATE_FILE"
     if $DRY_RUN; then
@@ -1779,6 +1802,7 @@ cmd_run() {
             IPS_FILE="$TMPD/sample_ips.txt"
             printf "%s\n" 192.0.2.1 192.0.2.10 192.0.2.11 192.0.2.12 192.0.2.13 203.0.113.5 203.0.113.9 198.51.100.0/24 > "$IPS_FILE"
         fi
+        warn "DRY RUN: scores below are MOCK data generated locally, NOT real AbuseIPDB results"
         info "dry-run: using mock AbuseIPDB responses, state file $state_file"
     fi
     ensure_state "$state_file"
