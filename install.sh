@@ -104,11 +104,13 @@ LIB_DIR="/usr/local/lib/abuse-checker"
 ENABLE=true
 INTERACTIVE=true
 UPGRADE_OS=false
+FROM_UPDATE=false
 
 for a in "$@"; do
     case "$a" in
         --no-enable) ENABLE=false ;;
         --non-interactive|--no-wizard|-n) INTERACTIVE=false ;;
+        --from-update) FROM_UPDATE=true; INTERACTIVE=false ;;
         --upgrade-os) UPGRADE_OS=true ;;
         -h|--help) echo "Usage: sudo $0 [--no-enable] [--non-interactive|--no-wizard] [--upgrade-os]"; exit 0 ;;
         *) echo "unknown option: $a" >&2; exit 2 ;;
@@ -337,15 +339,20 @@ if [[ -n "$TTY_FD" ]]; then
     [[ "$TTY_FD" == "3" ]] && exec 3<&-
 fi
 
+# `abuse-checker --update` already reports the result; first-install hints
+# would only be noise there.
+if ! $FROM_UPDATE; then
 cat <<MSG
 
 Next steps:
-  sudo abuse-checker --edit-secrets           # API keys, Telegram/Slack/Email (encrypted)
-  sudo editor $CONF_DIR/ips.txt               # IPs and CIDRs to monitor
-  sudo abuse-checker --dry-run                # pipeline check with mock data
-  sudo abuse-checker --test-notify            # test alert to every connector
+  sudo abuse-checker --edit-secrets      # API keys, Telegram/Slack/Email (encrypted)
+  sudo abuse-checker --add-ip <IP|CIDR>  # IPs and subnets to monitor
+  sudo abuse-checker --dry-run           # pipeline check with MOCK data
+  sudo abuse-checker --test-notify       # test alert to every connector
+  sudo abuse-checker --doctor            # system check
   sudo systemctl start abuse-checker.service && journalctl -u abuse-checker -n 50
-  sudo abuse-checker --uninstall              # remove (menu)
+  sudo abuse-checker --uninstall         # remove (menu)
 MSG
+fi
 exit 0
 }

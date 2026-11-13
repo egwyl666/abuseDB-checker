@@ -32,6 +32,11 @@ up="$(sed -n 's/^upload-file = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"
 [[ -n "$up" && -f "$up" ]] && cat "$up" >> "$MOCK_LOG/mail.log"
 
 case "$url" in
+    https://api.github.test/repos/*/commits/*)   # update check: branch head SHA
+        echo "$url" >> "$MOCK_LOG/update.log"
+        grep -q 'Accept: application/vnd.github.sha' <<< "$cfg" || { respond 415 'bad accept'; exit 0; }
+        if [[ -n "${MOCK_HEAD_SHA:-}" ]]; then respond 200 "$MOCK_HEAD_SHA"; else respond 403 '{"message":"API rate limit exceeded"}'; fi
+        exit 0 ;;
     https://jira.test*)          # Jira REST API emulation
         method="$(sed -n 's/^request = "\(.*\)"$/\1/p' <<< "$cfg" | head -n1)"
         path="${url#https://jira.test}"
