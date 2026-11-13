@@ -793,6 +793,8 @@ sudo abuse-checker --check-update    # installed vs latest version on GitHub
 sudo abuse-checker --update          # same as --self-update; add --force to reinstall
 ```
 
+`--check-update` asks the GitHub API for the newest commit on the branch and reads `AC_VERSION` at that exact commit, so it sees a new release immediately rather than a version cached by the CDN for a few minutes. If the API is unavailable (it allows 60 requests per hour without a token), it reads the branch file instead.
+
 `--update` works like this:
 
 1. It downloads the branch tarball into a private temporary directory.

@@ -972,6 +972,17 @@ MOCK_REMOTE_SCRIPT="$WORK/rel/same.remote.sh" upd --check-update
 check "--check-update: same version is up to date" grep -q "Up to date." <<< "$OUT"
 upd --check-update
 check "--check-update: GitHub unreachable -> error, rc!=0" bash -c '[[ $1 -ne 0 ]] && grep -q "could not determine" <<< "$2"' _ "$RC" "$OUT"
+SHA="0123456789abcdef0123456789abcdef01234567"
+gh_env() { env -u ABUSE_CHECKER_GITHUB_RAW ABUSE_CHECKER_GITHUB_API=https://api.github.test ABUSE_CHECKER_GITHUB_RAW_ROOT=https://raw.githubusercontent.test "$@"; }
+: > "$MOCK_LOG/update.log"
+OUT="$(gh_env MOCK_HEAD_SHA=$SHA MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" bash "$INSTALLED" --check-update 2>&1)"
+check "--check-update asks the API for the branch head" grep -q "^https://api.github.test/repos/egwyl666/abuseDB-checker/commits/main$" "$MOCK_LOG/update.log"
+check "--check-update reads the file at that commit (no stale CDN cache)" grep -q "^https://raw.githubusercontent.test/egwyl666/abuseDB-checker/$SHA/abuse-checker.sh$" "$MOCK_LOG/update.log"
+check "--check-update via commit finds v9.9.9" grep -q "Update available" <<< "$OUT"
+: > "$MOCK_LOG/update.log"
+OUT="$(gh_env MOCK_REMOTE_SCRIPT="$WORK/rel/good.remote.sh" bash "$INSTALLED" --check-update 2>&1)"
+check "API rate-limited -> falls back to the branch file" bash -c 'grep -q "^https://raw.githubusercontent.test/egwyl666/abuseDB-checker/main/abuse-checker.sh$" "$1" && grep -q "Update available" <<< "$2" && grep -q "GitHub API unavailable (HTTP 403)" <<< "$2"' _ "$MOCK_LOG/update.log" "$OUT"
+check "install.sh: --from-update hides first-install hints" bash -c 'grep -q -- "--from-update) FROM_UPDATE=true" "$1" && grep -q "if ! \$FROM_UPDATE; then" "$1" && grep -q -- "--no-wizard --from-update" "$2"' _ "$ROOT/install.sh" "$SCRIPT"
 
 reset_installed
 MOCK_TARBALL="$WORK/rel/good.tar.gz" upd --update

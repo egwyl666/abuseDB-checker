@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 027
 
-readonly AC_VERSION="1.6.0"
+readonly AC_VERSION="1.6.1"
 # Upstream repository used by --check-update / --update (override with
 # REPO_SLUG / REPO_BRANCH in the secrets store).
 readonly DEFAULT_REPO_SLUG="egwyl666/abuseDB-checker"
@@ -1051,7 +1051,31 @@ UPDATE_NOTICE=""
 
 repo_slug()   { printf '%s' "${REPO_SLUG:-$DEFAULT_REPO_SLUG}"; }
 repo_branch() { printf '%s' "${REPO_BRANCH:-$DEFAULT_REPO_BRANCH}"; }
-raw_url()     { printf '%s' "${ABUSE_CHECKER_GITHUB_RAW:-https://raw.githubusercontent.com/$(repo_slug)/$(repo_branch)}/abuse-checker.sh"; }
+# raw.githubusercontent.com caches a branch URL for ~5 minutes, so right
+# after a release the branch file can still be the old version. The check
+# therefore asks the GitHub API for the branch's current commit and reads
+# the file at that exact (immutable) commit; if the API is unavailable
+# (rate limit, proxy), it falls back to the branch URL.
+REMOTE_REF=""
+raw_url() {
+    if [[ -n "${ABUSE_CHECKER_GITHUB_RAW:-}" ]]; then printf '%s/abuse-checker.sh' "$ABUSE_CHECKER_GITHUB_RAW"; return; fi
+    printf '%s/%s/%s/abuse-checker.sh' "${ABUSE_CHECKER_GITHUB_RAW_ROOT:-https://raw.githubusercontent.com}" \
+        "$(repo_slug)" "${REMOTE_REF:-$(repo_branch)}"
+}
+# Sets REMOTE_REF to the branch head commit, or leaves it empty.
+resolve_remote_ref() {
+    local out="$1/head.sha" code sha
+    REMOTE_REF=""
+    [[ -n "${ABUSE_CHECKER_GITHUB_RAW:-}" ]] && return 0
+    code="$(secure_curl "$(cfg_line url "${ABUSE_CHECKER_GITHUB_API:-https://api.github.com}/repos/$(repo_slug)/commits/$(repo_branch)")
+$(cfg_line header "Accept: application/vnd.github.sha")" --max-time 15 -o "$out" -w '%{http_code}')" || code="000"
+    sha="$(tr -d '[:space:]' < "$out" 2>/dev/null)"
+    if [[ "$code" == "200" && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        REMOTE_REF="$sha"
+    else
+        info "GitHub API unavailable (HTTP $code); reading the branch file, which may be cached for a few minutes"
+    fi
+}
 archive_url() { printf '%s' "${ABUSE_CHECKER_GITHUB_ARCHIVE:-https://github.com/$(repo_slug)/archive/refs/heads/$(repo_branch).tar.gz}"; }
 
 # version_gt A B -> true when A is a newer version than B
@@ -1063,6 +1087,7 @@ script_version() { sed -n 's/^readonly AC_VERSION="\([0-9][0-9A-Za-z.+-]*\)"$/\1
 # Fetch the remote version (prints it). Public URL, but still sent via stdin.
 fetch_remote_version() {
     local out="$1/remote-abuse-checker.sh" code ver
+    resolve_remote_ref "$1"
     code="$(secure_curl "$(cfg_line url "$(raw_url)")" --location --max-time 30 -o "$out" -w '%{http_code}')" || code="000"
     # file:// mirrors report 000 on success.
     [[ "$code" == "200" || ( "$code" == "000" && "$(raw_url)" == file://* && -s "$out" ) ]] \
@@ -1152,7 +1177,7 @@ cmd_update() {
     if [[ -n "${ABUSE_CHECKER_UPDATE_INSTALLER:-}" ]]; then
         "$ABUSE_CHECKER_UPDATE_INSTALLER" "$src" </dev/null || die "installer failed"
     else
-        bash "$src/install.sh" --no-wizard </dev/null || die "install.sh failed"
+        bash "$src/install.sh" --no-wizard --from-update </dev/null || die "install.sh failed"
     fi
     [[ -w "$STATE_DIR" ]] && rm -f "$STATE_DIR/update-check.json"
     info "updated v$AC_VERSION -> v$ver"
